@@ -30,6 +30,11 @@ CONFIG = {
     "render_live": True,         # interactive matplotlib window
     "render_video": False,       # write an mp4 recording of the run
 
+    # Draw/record a frame only every Nth simulation step (1 = every step).
+    # Higher values speed up runs by skipping rendering work (mainly the live
+    # window); the simulation itself still steps every step.
+    "render_every": 1,
+
     # Video options (used when render_video is True)
     # Recordings are auto-named "<N>_<map>_<localization>_<agents>_<comm>.mp4"
     # inside video_dir, each with a matching .json setup file.
@@ -91,6 +96,10 @@ CONFIG = {
     "slam_num_particles": 200,   # particle cloud size
     "slam_measurement_sigma": 1.2,  # likelihood-field std-dev in cells (larger = more forgiving)
     "slam_z_rand": 0.1,          # uniform-noise floor for outlier robustness (0..1)
+    # Speed/accuracy knob: scan endpoints scored per particle per step. Lower is
+    # faster with graceful accuracy loss (see also slam_num_particles above and
+    # sensor_num_beams in the Sensor section).
+    "slam_max_endpoints": 24,
 
     # =========================
     # Mapping (occupancy grid)

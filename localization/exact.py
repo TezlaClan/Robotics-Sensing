@@ -26,6 +26,7 @@ class ExactLocalization:
         observations: List[Observation] = None,
         internal_map=None,
         anchors=None,
+        map_version=None,
     ) -> Position:
         return (
             believed_position[0] + motion[0],

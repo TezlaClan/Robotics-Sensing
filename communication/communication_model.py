@@ -60,10 +60,13 @@ class CommunicationModel:
             received_map = self._transmit_map(other.internal_map)
 
             # Merge: adopt the peer's CONFIDENT (locked) cells only.
-            self._merge_maps(
+            mask_changed = self._merge_maps(
                 agent.internal_map, agent.locked,
                 received_map, other.locked,
             )
+            # Wall mask changed -> invalidate the localizer's cached distance field.
+            if mask_changed and hasattr(agent, "_wallver"):
+                agent._wallver[0] += 1
 
     # =========================
     # Communication Rules
@@ -126,6 +129,9 @@ class CommunicationModel:
     # Map Fusion
     # =========================
 
+    # Occupancy above which a cell counts as a wall (matches the localizer).
+    _WALL = 0.6
+
     def _merge_maps(self, target_map, target_locked, incoming_map, incoming_locked):
         """
         Confident-knowledge merge: adopt only the cells the sender has *locked*.
@@ -146,11 +152,18 @@ class CommunicationModel:
         """
         height = len(target_map)
         width = len(target_map[0])
+        mask_changed = False
 
         for y in range(height):
             for x in range(width):
                 if target_locked[y][x]:
                     continue  # our own confident knowledge stands
                 if incoming_locked[y][x]:
-                    target_map[y][x] = incoming_map[y][x]
+                    inc = incoming_map[y][x]
+                    # Only a wall-threshold crossing matters to the localizer.
+                    if (target_map[y][x] > self._WALL) != (inc > self._WALL):
+                        mask_changed = True
+                    target_map[y][x] = inc
                     target_locked[y][x] = True
+
+        return mask_changed

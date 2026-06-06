@@ -32,6 +32,7 @@ class Simulation:
 
         self.max_steps = config["max_steps"]
         self.dt = config["dt"]
+        self.render_every = max(1, int(config.get("render_every", 1)))
 
         # Metrics
         self.current_step = 0
@@ -95,11 +96,13 @@ class Simulation:
         elif self.current_step % 50 == 0:
             print(f"Step {self.current_step}")
 
-        for renderer in self.renderers:
-            try:
-                renderer.render()
-            except Exception as e:
-                print(f"ERROR in renderer.render(): {e}")
+        # Render only every Nth step (render_every); always render the first step.
+        if self.current_step % self.render_every == 0:
+            for renderer in self.renderers:
+                try:
+                    renderer.render()
+                except Exception as e:
+                    print(f"ERROR in renderer.render(): {e}")
                 import traceback
                 traceback.print_exc()
 

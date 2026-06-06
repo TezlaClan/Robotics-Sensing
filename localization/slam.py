@@ -34,6 +34,8 @@ import math
 import random
 from typing import Tuple, List, Optional
 
+import numpy as np
+
 Position = Tuple[float, float]
 RelObservation = Tuple[int, int, bool]  # (dx, dy, occupied) in the robot frame
 
@@ -94,6 +96,12 @@ class SLAMLocalization:
         self.particles: Optional[List[List[float]]] = None
         self.weights: Optional[List[float]] = None
 
+        # Cached distance field (likelihood field), keyed by the map version it
+        # was built from, so it is recomputed only when the map actually changes.
+        self._dist_field: Optional[np.ndarray] = None
+        self._wallmask: Optional[np.ndarray] = None  # cached boolean wall mask
+        self._df_version = None
+
     # =========================
     # Main API
     # =========================
@@ -105,6 +113,7 @@ class SLAMLocalization:
         scan: List[RelObservation],
         internal_map: Optional[List[List[float]]] = None,
         anchors: Optional[List[Tuple[Position, float]]] = None,
+        map_version=None,
     ) -> Position:
         # 1. Lazy init around the (known) start pose.
         if self.particles is None:
@@ -116,8 +125,9 @@ class SLAMLocalization:
         # 3. Measurement update (requires the map).
         #    `anchors` are implied-pose hints from confident neighbours (swarm
         #    SLAM); they add evidence alongside the agent's own scan.
+        #    `map_version` lets the distance field be cached across steps.
         if internal_map is not None:
-            self._weight(scan, internal_map, anchors)
+            self._weight(scan, internal_map, anchors, map_version)
             self._resample_if_needed(internal_map)
 
         # 4. Report the weighted-mean pose, kept out of known walls.
@@ -160,88 +170,113 @@ class SLAMLocalization:
     # 3. Measurement model (likelihood field)
     # =========================
 
-    def _weight(self, scan: List[RelObservation], internal_map, anchors=None):
-        height = len(internal_map)
-        width = len(internal_map[0])
+    # Distances at/above this are treated as "no nearby wall measured"
+    # (uninformative -> the reading contributes only the z_rand floor). Only
+    # occurs when the map has no walls at all (e.g. before any sensing).
+    _DF_INF = 1e9
+    # Max chamfer-propagation iterations. 12 cells is well past where the
+    # likelihood is non-negligible (exp(-12^2/2/1.2^2) ~ 1e-22), so the field is
+    # numerically identical to full convergence where it matters.
+    _DF_CAP = 12
 
-        dist_field = self._distance_transform(internal_map, width, height)
+    def _weight(self, scan: List[RelObservation], internal_map, anchors=None, map_version=None):
+        """
+        Vectorised likelihood-field measurement update (numpy).
 
-        # Swarm-SLAM anchor term: each (implied_pos, weight) rewards particles
-        # near a pose implied by a confident neighbour's relative measurement.
+        Identical model to the original per-particle loop - obstacle hits scored
+        against a bilinearly-interpolated distance field, free readings penalised
+        where they fall on walls, an in-wall penalty, swarm anchors, log-sum-exp
+        normalisation, and the Augmented-MCL fit tracking - but evaluated over all
+        particles and scan endpoints at once.
+        """
+        # The measurement update depends on the map ONLY through the binary wall
+        # mask (cell > _WALL_THRESHOLD): the distance field, the free-cell-on-wall
+        # test, and the in-wall penalty all use it. So cache the boolean mask and
+        # the distance field together, keyed by map_version (which the agent bumps
+        # only when a cell crosses the wall threshold). On the common step where
+        # values drift but no cell flips, this skips the array build AND the
+        # transform entirely. Behaviour is identical to recomputing every step.
+        if (self._dist_field is None or map_version is None
+                or map_version != self._df_version):
+            occ = np.asarray(internal_map, dtype=float) > _WALL_THRESHOLD  # (H, W)
+            self._dist_field = self._distance_transform(occ)
+            self._wallmask = occ
+            self._df_version = map_version
+        occ = self._wallmask
+        df = self._dist_field
+        height, width = occ.shape
+
         anchor_two_sigma_sq = 2.0 * self.anchor_sigma * self.anchor_sigma
+        two_sigma_sq = 2.0 * self.measurement_sigma * self.measurement_sigma
+        log_floor = math.log(self.z_rand) if self.z_rand > 0 else -50.0
+        log_free_conflict = math.log(0.35)  # free-cell-on-wall mismatch
+        log_wall_penalty = math.log(1e-3)   # particle inside a known wall
 
         # Positive evidence: obstacle hits should land on map walls.
         hits = self._subsample([(dx, dy) for dx, dy, occ in scan if occ], self.max_endpoints)
-        # Negative evidence: cells seen as free should NOT be map walls. This
-        # breaks perceptual aliasing, where a wrong pose explains the walls just
-        # as well but would put free space where obstacles actually are.
+        # Negative evidence: cells seen as free should NOT be map walls (breaks
+        # perceptual aliasing where a wrong pose still explains the walls).
         frees = self._subsample([(dx, dy) for dx, dy, occ in scan if not occ], self.max_endpoints)
-
-        two_sigma_sq = 2.0 * self.measurement_sigma * self.measurement_sigma
-        log_floor = math.log(self.z_rand) if self.z_rand > 0 else -50.0
-        log_free_conflict = math.log(0.35)  # penalty for free-cell-on-wall mismatch
-        log_wall_penalty = math.log(1e-3)   # particle sitting inside a known wall
-
         n_terms = len(hits) + len(frees)
 
-        log_weights = []
-        fits = []  # absolute per-particle fit in [0, 1], for divergence detection
-        for px, py in self.particles:
-            score_lw = 0.0  # measurement fit only (no self-in-wall penalty)
+        P = np.asarray(self.particles, dtype=float)          # (N, 2)
+        N = P.shape[0]
+        px, py = P[:, 0], P[:, 1]
 
-            # Obstacle hits vs the (bilinearly-interpolated) likelihood field.
-            # Continuous endpoints + continuous field => the score varies smoothly
-            # with sub-cell particle position, so the filter resolves within a tile.
-            for dx, dy in hits:
-                d = self._sample_field(dist_field, px + dx, py + dy, width, height)
-                if d is None:
-                    prob = self.z_rand
-                else:
-                    prob = (1.0 - self.z_rand) * math.exp(-(d * d) / two_sigma_sq) + self.z_rand
-                score_lw += math.log(prob) if prob > 0 else log_floor
+        score = np.zeros(N)                                  # measurement fit only
 
-            # Free readings that would fall inside a known wall are contradictions.
-            for dx, dy in frees:
-                ix, iy = int(px + dx), int(py + dy)
-                if 0 <= ix < width and 0 <= iy < height and internal_map[iy][ix] > _WALL_THRESHOLD:
-                    score_lw += log_free_conflict
+        # --- Obstacle hits vs the bilinearly-interpolated likelihood field. ---
+        if hits:
+            Hh = np.asarray(hits, dtype=float)               # (Kh, 2)
+            sx = px[:, None] + Hh[None, :, 0]                # (N, Kh)
+            sy = py[:, None] + Hh[None, :, 1]
+            prob = self._sample_prob(df, sx, sy, two_sigma_sq, width, height)
+            logp = np.where(prob > 0, np.log(np.where(prob > 0, prob, 1.0)), log_floor)
+            score += logp.sum(axis=1)
 
-            # Geometric-mean per-term likelihood: an absolute measure of how well
-            # this particle explains the scan (1 = perfect, low = lost).
-            fits.append(math.exp(score_lw / n_terms) if n_terms else 1.0)
+        # --- Free readings that fall inside a known wall are contradictions. ---
+        if frees:
+            Ff = np.asarray(frees, dtype=float)              # (Kf, 2)
+            fix = (px[:, None] + Ff[None, :, 0]).astype(int)  # int() truncation
+            fiy = (py[:, None] + Ff[None, :, 1]).astype(int)
+            inb = (fix >= 0) & (fix < width) & (fiy >= 0) & (fiy < height)
+            wall = inb & occ[np.clip(fiy, 0, height - 1), np.clip(fix, 0, width - 1)]
+            score += wall.sum(axis=1) * log_free_conflict
 
-            lw = score_lw
-            # Physically impossible to sit inside a known wall.
-            ipx, ipy = int(px), int(py)
-            if not (0 <= ipx < width and 0 <= ipy < height) or internal_map[ipy][ipx] > _WALL_THRESHOLD:
-                lw += log_wall_penalty
+        # Per-particle absolute fit (geometric-mean per-term likelihood).
+        fits = np.exp(score / n_terms) if n_terms else np.ones(N)
 
-            # Inter-agent anchors (added to the resampling weight only, NOT the
-            # fit, so they don't mask our own divergence). Scaled by the
-            # neighbour's confidence: a sure neighbour pulls harder. When our own
-            # scan is uninformative these terms dominate and the cloud snaps
-            # toward the neighbour's implied pose (collaborative recovery).
-            if anchors:
-                for (ax, ay), conf in anchors:
-                    d2 = (px - ax) ** 2 + (py - ay) ** 2
-                    lw += conf * (-d2 / anchor_two_sigma_sq)
+        lw = score.copy()
 
-            log_weights.append(lw)
+        # Physically impossible to sit inside a known wall.
+        ipx, ipy = px.astype(int), py.astype(int)
+        inb = (ipx >= 0) & (ipx < width) & (ipy >= 0) & (ipy < height)
+        in_wall = (~inb) | occ[np.clip(ipy, 0, height - 1), np.clip(ipx, 0, width - 1)]
+        lw += in_wall * log_wall_penalty
+
+        # Inter-agent anchors (added to the resampling weight only, NOT the fit,
+        # so they don't mask our own divergence). When our own scan is
+        # uninformative these dominate and the cloud snaps toward the confident
+        # neighbour's implied pose (collaborative recovery).
+        if anchors:
+            for (ax, ay), conf in anchors:
+                d2 = (px - ax) ** 2 + (py - ay) ** 2
+                lw += conf * (-d2 / anchor_two_sigma_sq)
 
         # Normalise from log-space (subtract max for stability).
-        max_lw = max(log_weights)
-        raw = [math.exp(lw - max_lw) for lw in log_weights]
-        total = sum(raw)
+        max_lw = lw.max()
+        raw = np.exp(lw - max_lw)
+        total = raw.sum()
         if total <= 0:
             self.weights = [1.0 / self.num_particles] * self.num_particles
         else:
-            self.weights = [w / total for w in raw]
+            self.weights = (raw / total).tolist()
 
         # Augmented MCL: update slow/fast fit averages and set injection ratio.
-        # When recent fit (w_fast) drops below the long-run fit (w_slow), the
+        # When recent fit (w_fast) drops below the long-run fit (w_slow) the
         # filter is likely lost, so inject random hypotheses on resample.
         if n_terms:
-            w_avg = sum(fits) / len(fits)
+            w_avg = float(fits.mean())
             self.w_slow += self.alpha_slow * (w_avg - self.w_slow)
             self.w_fast += self.alpha_fast * (w_avg - self.w_fast)
             if self.w_slow > 0:
@@ -249,71 +284,89 @@ class SLAMLocalization:
             else:
                 self.injection_ratio = 0.0
 
-    def _distance_transform(self, internal_map, width, height):
-        """Chamfer distance to the nearest known wall (the likelihood field)."""
-        INF = float("inf")
-        D = [
-            [0.0 if internal_map[y][x] > _WALL_THRESHOLD else INF for x in range(width)]
-            for y in range(height)
-        ]
+    def _distance_transform(self, occ: np.ndarray) -> np.ndarray:
+        """
+        Chamfer distance (orthogonal step 1, diagonal step sqrt(2)) to the
+        nearest wall, computed as a vectorised min-of-shifted-neighbours
+        (Bellman-Ford on the chamfer mask) iterated to convergence. This is the
+        same metric the old two-pass chamfer produced, so the likelihood field is
+        numerically identical - just computed with numpy instead of Python loops.
+        Converges in O(grid diameter) sweeps; we cap at width+height and break
+        early once stable.
+        """
+        INF = self._DF_INF
+        D = np.where(occ, 0.0, INF)
+        if not occ.any():
+            return D  # no walls measured yet -> all uninformative
 
-        # Forward pass
-        for y in range(height):
-            for x in range(width):
-                if D[y][x] == 0.0:
-                    continue
-                best = D[y][x]
-                if x > 0:
-                    best = min(best, D[y][x - 1] + 1.0)
-                if y > 0:
-                    best = min(best, D[y - 1][x] + 1.0)
-                if x > 0 and y > 0:
-                    best = min(best, D[y - 1][x - 1] + _SQRT2)
-                if x < width - 1 and y > 0:
-                    best = min(best, D[y - 1][x + 1] + _SQRT2)
-                D[y][x] = best
-
-        # Backward pass
-        for y in range(height - 1, -1, -1):
-            for x in range(width - 1, -1, -1):
-                best = D[y][x]
-                if x < width - 1:
-                    best = min(best, D[y][x + 1] + 1.0)
-                if y < height - 1:
-                    best = min(best, D[y + 1][x] + 1.0)
-                if x < width - 1 and y < height - 1:
-                    best = min(best, D[y + 1][x + 1] + _SQRT2)
-                if x > 0 and y < height - 1:
-                    best = min(best, D[y + 1][x - 1] + _SQRT2)
-                D[y][x] = best
-
+        # Only distances up to a few measurement sigmas affect the likelihood
+        # (beyond ~10 cells exp(-d^2/2sigma^2) < 1e-15), so iterating past that is
+        # wasted: cap propagation there. Identical likelihood to full convergence,
+        # but bounds the iteration count in open maps. Early-break when stable.
+        max_iters = min(self._DF_CAP, D.shape[0] + D.shape[1])
+        for _ in range(max_iters):
+            best = D.copy()
+            # orthogonal neighbours (+1)
+            best[1:, :] = np.minimum(best[1:, :], D[:-1, :] + 1.0)
+            best[:-1, :] = np.minimum(best[:-1, :], D[1:, :] + 1.0)
+            best[:, 1:] = np.minimum(best[:, 1:], D[:, :-1] + 1.0)
+            best[:, :-1] = np.minimum(best[:, :-1], D[:, 1:] + 1.0)
+            # diagonal neighbours (+sqrt2)
+            best[1:, 1:] = np.minimum(best[1:, 1:], D[:-1, :-1] + _SQRT2)
+            best[1:, :-1] = np.minimum(best[1:, :-1], D[:-1, 1:] + _SQRT2)
+            best[:-1, 1:] = np.minimum(best[:-1, 1:], D[1:, :-1] + _SQRT2)
+            best[:-1, :-1] = np.minimum(best[:-1, :-1], D[1:, 1:] + _SQRT2)
+            if np.array_equal(best, D):
+                break
+            D = best
         return D
 
-    def _sample_field(self, dist_field, x, y, width, height):
+    def _sample_prob(self, df, x, y, two_sigma_sq, width, height):
         """
-        Bilinearly interpolate the cell-centred distance field at continuous
-        world point (x, y). Cell (i, j) is centred at (i + 0.5, j + 0.5).
-        Returns None if out of bounds or next to an unmeasured (infinite) cell.
+        Vectorised bilinear interpolation of the cell-centred distance field at
+        continuous points (x, y) -> hit probability with the z_rand floor. Cell
+        (i, j) is centred at (i + 0.5, j + 0.5). Points out of bounds, or whose
+        interpolation cell touches an unmeasured (>= _DF_INF) corner, get the
+        z_rand floor (uninformative), matching the old scalar _sample_field.
         """
+        thr = self._DF_INF * 0.1
+        z = self.z_rand
+
         fx, fy = x - 0.5, y - 0.5
-        x0, y0 = math.floor(fx), math.floor(fy)
+        x0 = np.floor(fx).astype(int)
+        y0 = np.floor(fy).astype(int)
         x1, y1 = x0 + 1, y0 + 1
 
-        if x0 < 0 or y0 < 0 or x1 >= width or y1 >= height:
-            ix, iy = int(x), int(y)
-            if 0 <= ix < width and 0 <= iy < height and not math.isinf(dist_field[iy][ix]):
-                return dist_field[iy][ix]
-            return None
-
-        d00, d10 = dist_field[y0][x0], dist_field[y0][x1]
-        d01, d11 = dist_field[y1][x0], dist_field[y1][x1]
-        if math.isinf(d00) or math.isinf(d10) or math.isinf(d01) or math.isinf(d11):
-            return None  # no nearby wall measured -> uninformative
-
+        # Primary case: the 2x2 bilinear cell is fully in bounds with all corners
+        # measured -> interpolate.
+        valid = (x0 >= 0) & (y0 >= 0) & (x1 < width) & (y1 < height)
+        x0c, x1c = np.clip(x0, 0, width - 1), np.clip(x1, 0, width - 1)
+        y0c, y1c = np.clip(y0, 0, height - 1), np.clip(y1, 0, height - 1)
+        d00 = df[y0c, x0c]; d10 = df[y0c, x1c]
+        d01 = df[y1c, x0c]; d11 = df[y1c, x1c]
+        measured = (d00 < thr) & (d10 < thr) & (d01 < thr) & (d11 < thr)
         tx, ty = fx - x0, fy - y0
         top = d00 * (1 - tx) + d10 * tx
         bot = d01 * (1 - tx) + d11 * tx
-        return top * (1 - ty) + bot * ty
+        d_bil = top * (1 - ty) + bot * ty
+
+        prob_bil = (1.0 - z) * np.exp(-(d_bil * d_bil) / two_sigma_sq) + z
+        prob = np.where(valid & measured, prob_bil, z)
+
+        # Fallback (only when the bilinear cell is out of bounds): the single
+        # int(x), int(y) cell, if in bounds and measured. Mirrors the scalar
+        # _sample_field so edge geometry is scored identically. Skipped entirely
+        # in the common case where every point's bilinear cell is in bounds.
+        oob = ~valid
+        if oob.any():
+            ix = x.astype(int)
+            iy = y.astype(int)
+            fb_inb = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+            d_fb = df[np.clip(iy, 0, height - 1), np.clip(ix, 0, width - 1)]
+            fb_ok = oob & fb_inb & (d_fb < thr)
+            prob_fb = (1.0 - z) * np.exp(-(d_fb * d_fb) / two_sigma_sq) + z
+            prob = np.where(fb_ok, prob_fb, prob)
+        return prob
 
     def _subsample(self, items, limit):
         if len(items) <= limit:

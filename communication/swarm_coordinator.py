@@ -23,6 +23,10 @@ class SwarmCoordinator:
         # Present only in "shared" map mode; all agents reference these grids.
         self.shared_map = shared_map
         self.shared_locked = shared_locked
+        # Shared wall-mask version (1-element list, shared by reference) so that
+        # in shared-map mode any agent's wall change invalidates every agent's
+        # cached distance field. See agents/base_agent.py and core/agent.py.
+        self.wallver = [0]
 
         # Sticky: the id of the agent assigned to reach the goal (None until the
         # goal is discovered and the nearest agent claims it).

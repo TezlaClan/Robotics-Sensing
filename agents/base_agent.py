@@ -24,6 +24,11 @@ from utils.debug import dprint
 Position = Tuple[float, float]
 GridPosition = Tuple[int, int]
 
+# Occupancy above which a cell counts as a wall for localization. Must match
+# localization/slam.py's _WALL_THRESHOLD: the SLAM update depends on the map only
+# through (cell > WALL_THR), so wall_version need only track crossings of this.
+WALL_THR = 0.6
+
 
 class BaseAgent:
     def __init__(
@@ -107,6 +112,17 @@ class BaseAgent:
         self.map_width = map_width
         self.map_height = map_height
 
+        # Bumped only when the WALL MASK changes - i.e. a cell crosses the
+        # localizer's wall threshold (WALL_THR). The SLAM measurement update
+        # depends on the map solely through that binary mask, so this lets the
+        # distance field be cached across the many steps where cell values drift
+        # without any cell flipping wall<->not-wall.
+        # Held in a 1-element list so it can be SHARED by reference: in "shared"
+        # map mode every agent writes the one grid, so they must share one version
+        # (any agent's wall change must invalidate everyone's cached field). In
+        # "individual" mode each agent keeps its own. See core/agent.py.
+        self._wallver = [0]
+
         # =========================
         # Modules
         # =========================
@@ -172,6 +188,7 @@ class BaseAgent:
             scan,
             self.internal_map,
             anchors=anchors,
+            map_version=self._wallver[0],
         )
 
         # 4. Planning
@@ -262,6 +279,7 @@ class BaseAgent:
         """
 
         step = self.map_update_step
+        mask_changed = False
 
         for x, y, occupied in observations:
             if not (0 <= x < self.map_width and 0 <= y < self.map_height):
@@ -269,14 +287,21 @@ class BaseAgent:
             if self.locked[y][x]:
                 continue
 
+            before = self.internal_map[y][x]
             if occupied:
-                self.internal_map[y][x] = min(1.0, self.internal_map[y][x] + step)
+                after = min(1.0, before + step)
             else:
-                self.internal_map[y][x] = max(0.0, self.internal_map[y][x] - step)
+                after = max(0.0, before - step)
+            self.internal_map[y][x] = after
+            # Only a crossing of the wall threshold affects the SLAM update.
+            if (before > WALL_THR) != (after > WALL_THR):
+                mask_changed = True
 
-            prob = self.internal_map[y][x]
-            if prob >= self.map_lock_high or prob <= self.map_lock_low:
+            if after >= self.map_lock_high or after <= self.map_lock_low:
                 self.locked[y][x] = True
+
+        if mask_changed:
+            self._wallver[0] += 1
 
     # =========================
     # Planning Logic
@@ -434,6 +459,10 @@ class BaseAgent:
 
         for bx, by in boundary:
             self.internal_map[by][bx] = 0.5  # reset to unknown
+
+        if boundary:
+            # Reopened cells were believed-walls (>0.6) reset to 0.5: mask changed.
+            self._wallver[0] += 1
 
         return len(boundary)
 

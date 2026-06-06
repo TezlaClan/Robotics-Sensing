@@ -32,6 +32,7 @@ def _create_localization(config, rng_manager):
             measurement_sigma=config.get("slam_measurement_sigma", 1.2),
             z_rand=config.get("slam_z_rand", 0.1),
             anchor_sigma=config.get("slam_anchor_sigma", 1.0),
+            max_endpoints=config.get("slam_max_endpoints", 24),
             rng_manager=rng_manager,
         )
     elif kind == "exact":
@@ -122,9 +123,12 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
 
     # In "shared" map mode all agents reference the one grid held by the
     # coordinator, so every observation accumulates into a single global map.
+    # They must also share one wall-mask version, so any agent's wall change
+    # invalidates every agent's cached distance field.
     if (config.get("map_sharing", "individual") == "shared"
             and coordinator is not None and coordinator.shared_map is not None):
         agent.internal_map = coordinator.shared_map
         agent.locked = coordinator.shared_locked
+        agent._wallver = coordinator.wallver
 
     return agent
