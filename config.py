@@ -11,7 +11,7 @@ CONFIG = {
     "map_width": 41,
     "map_height": 41,
     # "maze", "room", "mixed", "cave", "obstacle", "bsp"
-    "map_type": "bsp",
+    "map_type": "cave",
 
     # =========================
     # Simulation
@@ -50,7 +50,7 @@ CONFIG = {
     # =========================
     # Sensor
     # =========================
-    "sensor_range": 5,
+    "sensor_range": 8,
     "sensor_mode": "radius",  # "radius" or "los"
     "sensor_false_positive": 0.0,
     "sensor_false_negative": 0.0,
@@ -58,7 +58,10 @@ CONFIG = {
     # =========================
     # Localization
     # =========================
-    "odometry_noise": 0.0,
+    "localization": "slam",   # "odometry", "slam", "exact"
+    "odometry_noise": 0.1,    # per-step drift std-dev (used by odometry + slam)
+    "slam_search_radius": 3,  # cells searched around the odometry prediction
+    "slam_gain": 0.5,         # 0..1 pull toward the scan match (0 disables correction)
 
     # =========================
     # Seeds

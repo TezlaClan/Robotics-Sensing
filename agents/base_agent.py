@@ -121,7 +121,8 @@ class BaseAgent:
         self.believed_position = self.localization_model.update(
             self.believed_position,
             self.actual_motion,
-            observations
+            observations,
+            self.internal_map
         )
 
         # 4. Planning

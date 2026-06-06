@@ -38,6 +38,7 @@ class OdometryLocalization:
         believed_position: Position,
         velocity: Position,
         observations=None,
+        internal_map=None,
     ) -> Position:
         """
         Update believed position using odometry + noise.

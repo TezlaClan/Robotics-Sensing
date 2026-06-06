@@ -8,9 +8,36 @@ from agents.base_agent import BaseAgent
 
 from sensing.sensor_model import SensorModel
 from localization.odometry import OdometryLocalization
+from localization.slam import SLAMLocalization
+from localization.exact import ExactLocalization
 from planning.astar import AStarPlanner
 from exploration.frontier import FrontierExploration
 from communication.communication_model import CommunicationModel
+
+
+def _create_localization(config, rng_manager):
+    """Build the localization model selected by config["localization"]."""
+    kind = config.get("localization", "odometry")
+
+    if kind == "odometry":
+        return OdometryLocalization(
+            noise_sigma=config["odometry_noise"],
+            rng_manager=rng_manager,
+        )
+    elif kind == "slam":
+        return SLAMLocalization(
+            noise_sigma=config["odometry_noise"],
+            sensor_range=config["sensor_range"],
+            search_radius=config.get("slam_search_radius", 3),
+            gain=config.get("slam_gain", 0.5),
+            rng_manager=rng_manager,
+        )
+    elif kind == "exact":
+        return ExactLocalization(rng_manager=rng_manager)
+    else:
+        raise ValueError(
+            f"Unknown localization: {kind}. Options: odometry, slam, exact"
+        )
 
 
 def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config):
@@ -30,12 +57,9 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
     )
 
     # =========================
-    # Localization (MVP = odometry only)
+    # Localization (odometry / slam / exact)
     # =========================
-    localization = OdometryLocalization(
-        noise_sigma=config["odometry_noise"],
-        rng_manager=rng_manager
-    )
+    localization = _create_localization(config, rng_manager)
 
     # =========================
     # Exploration

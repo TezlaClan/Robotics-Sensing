@@ -36,6 +36,18 @@ class AStarPlanner:
         Compute path from start to goal.
         """
 
+        height = len(internal_map)
+        width = len(internal_map[0])
+
+        def in_bounds(cell):
+            return 0 <= cell[0] < width and 0 <= cell[1] < height
+
+        # Can't plan from / to a cell outside the map (e.g. if a bad pose
+        # estimate puts the start off-grid).
+        if not in_bounds(start) or not in_bounds(goal):
+            dprint(f"[A*] Start {start} or goal {goal} out of bounds")
+            return []
+
         if start == goal:
             dprint(f"[A*] Start == Goal: {start}")
             return []
