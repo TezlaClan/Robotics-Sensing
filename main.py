@@ -13,6 +13,7 @@ from core.environment import Environment
 from core.simulation import Simulation
 
 from core.agent import create_agent
+from communication.swarm_coordinator import SwarmCoordinator
 
 # TEMP: using existing generator classes
 from maps.maze_generator import MazeGenerator
@@ -90,25 +91,41 @@ def main():
     dprint("Environment created")
 
     # =========================
-    # Agent
+    # Swarm coordinator (shared blackboard)
     # =========================
-    dprint("4. Creating agent...")
+    # In "shared" map mode all agents read/write one occupancy grid held by the
+    # coordinator; otherwise each agent gets its own and they merge when in range.
+    if CONFIG.get("map_sharing", "individual") == "shared":
+        w, h = map_obj.width, map_obj.height
+        shared_map = [[0.5 for _ in range(w)] for _ in range(h)]
+        shared_locked = [[False for _ in range(w)] for _ in range(h)]
+        coordinator = SwarmCoordinator(shared_map=shared_map, shared_locked=shared_locked)
+    else:
+        coordinator = SwarmCoordinator()
+
+    # =========================
+    # Agents
+    # =========================
+    num_agents = CONFIG.get("num_agents", 1)
+    dprint(f"4. Creating {num_agents} agent(s)...")
     start_pos = (map_obj.start[0] + 0.5, map_obj.start[1] + 0.5)
     dprint(f"   Map start (grid): {map_obj.start}")
     dprint(f"   Start position (centered): {start_pos}")
     dprint(f"   Map goal (grid): {map_obj.goal}")
 
-    agent = create_agent(
-        agent_id=0,
-        start_pos=start_pos,
-        map_width=map_obj.width,
-        map_height=map_obj.height,
-        rng_manager=rng_manager,
-        config=CONFIG
-    )
-    dprint("Agent created")
-
-    agents = [agent]
+    agents = []
+    for i in range(num_agents):
+        agent = create_agent(
+            agent_id=i,
+            start_pos=start_pos,
+            map_width=map_obj.width,
+            map_height=map_obj.height,
+            rng_manager=rng_manager,
+            config=CONFIG,
+            coordinator=coordinator,
+        )
+        agents.append(agent)
+    dprint(f"{num_agents} agent(s) created")
 
     # =========================
     # Simulation

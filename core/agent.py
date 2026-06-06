@@ -31,6 +31,7 @@ def _create_localization(config, rng_manager):
             num_particles=config.get("slam_num_particles", 200),
             measurement_sigma=config.get("slam_measurement_sigma", 1.2),
             z_rand=config.get("slam_z_rand", 0.1),
+            anchor_sigma=config.get("slam_anchor_sigma", 1.0),
             rng_manager=rng_manager,
         )
     elif kind == "exact":
@@ -41,7 +42,8 @@ def _create_localization(config, rng_manager):
         )
 
 
-def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config):
+def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config,
+                 coordinator=None):
     """
     Factory method to create a fully configured agent.
     """
@@ -76,12 +78,20 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
     planner = AStarPlanner()
 
     # =========================
-    # Communication (disabled for MVP behaviour)
+    # Communication
     # =========================
+    # In "shared" map mode every agent writes the same grid, so map exchange is
+    # redundant -> "off". Otherwise honour the configured mode/range/noise.
+    if config.get("map_sharing", "individual") == "shared":
+        comm_mode = "off"
+    else:
+        comm_mode = config.get("comm_mode", "local")
+
     communication = CommunicationModel(
-        mode="global",
-        packet_loss_rate=0.0,
-        corruption_rate=0.0,
+        mode=comm_mode,
+        communication_range=config.get("communication_range", 10.0),
+        packet_loss_rate=config.get("comm_packet_loss", 0.0),
+        corruption_rate=config.get("comm_corruption", 0.0),
         rng_manager=rng_manager
     )
 
@@ -104,6 +114,17 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         map_update_step=config.get("map_update_step", 0.1),
         map_lock_high=config.get("map_lock_high", 0.9),
         map_lock_low=config.get("map_lock_low", 0.1),
+        coordinator=coordinator,
+        communication_range=config.get("communication_range", 10.0),
+        swarm_slam=config.get("swarm_slam", False),
+        sensor_range_sigma=config.get("sensor_range_sigma", 0.0),
     )
+
+    # In "shared" map mode all agents reference the one grid held by the
+    # coordinator, so every observation accumulates into a single global map.
+    if (config.get("map_sharing", "individual") == "shared"
+            and coordinator is not None and coordinator.shared_map is not None):
+        agent.internal_map = coordinator.shared_map
+        agent.locked = coordinator.shared_locked
 
     return agent

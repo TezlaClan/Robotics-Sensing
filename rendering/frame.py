@@ -8,6 +8,8 @@ Which visual layers are drawn is controlled by a `layers` dict
 (see config["render_layers"]).
 """
 
+import math
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -22,10 +24,11 @@ DEFAULT_LAYERS = {
     "path": True,
     "particles": True,
     "agents": True,
+    "links": True,
 }
 
 
-def draw_frame(ax, environment, agents, layers=None):
+def draw_frame(ax, environment, agents, layers=None, comm_range=None):
     """
     Draw a single simulation frame onto `ax`.
 
@@ -123,6 +126,20 @@ def draw_frame(ax, environment, agents, layers=None):
                 [p[1] for p in particles],
                 c='orange', s=4, alpha=0.35, zorder=2, linewidths=0,
             )
+
+    # =========================
+    # 5c. Communication links (faint line between in-range agents)
+    # =========================
+    if layers.get("links", True) and comm_range and len(agents) > 1:
+        for i in range(len(agents)):
+            for j in range(i + 1, len(agents)):
+                ax_, ay_ = agents[i].true_position
+                bx_, by_ = agents[j].true_position
+                if math.hypot(ax_ - bx_, ay_ - by_) <= comm_range:
+                    ax.plot(
+                        [ax_, bx_], [ay_, by_],
+                        color='yellow', linewidth=1.0, alpha=0.35, zorder=2,
+                    )
 
     # =========================
     # 6. Agents (true = red, believed = blue)

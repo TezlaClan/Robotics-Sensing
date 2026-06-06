@@ -31,27 +31,87 @@ class FrontierExploration:
     def choose_target(
         self,
         agent,
-        internal_map
+        internal_map,
+        agents=None,
     ) -> Optional[GridPosition]:
         """
-        Select the nearest *reachable* frontier as the next exploration target.
+        Select an exploration frontier for `agent`.
 
-        Reachability is measured by a BFS over known-free cells from the agent's
-        position, so the chosen frontier is the closest one along a corridor the
-        agent can actually traverse - not just the closest as the crow flies.
-        This avoids picking a frontier that is near in straight-line distance but
-        only reachable by going all the way around the maze.
+        Multi-agent: frontiers are partitioned between agents by *proximity*, not
+        by who picks first. A single multi-source BFS from every active agent
+        labels each known-free cell with its nearest agent (a Voronoi partition),
+        and this agent takes the nearest frontier in its own region. So a frontier
+        always goes to the agent actually closest to it - no agent gets blocked
+        from a near frontier by another's earlier claim (which previously forced
+        long backtracks). If this agent owns no frontier, it falls back to its
+        nearest reachable one so it always has something to do.
+
+        Single-agent: just the nearest reachable frontier.
         """
 
         start = agent._to_grid(agent.believed_position)
-        target = self._nearest_reachable_frontier(internal_map, start)
+
+        active = [a for a in (agents or []) if not getattr(a, "finished", False)]
+        if len(active) > 1:
+            target = self._voronoi_frontier(internal_map, agent, active)
+        else:
+            target = self._nearest_reachable_frontier(internal_map, start)
 
         if target is None:
             dprint(f"[Exploration] No reachable frontiers found (agent at {start})")
             return None
 
-        dprint(f"[Exploration] Agent at {start}, nearest reachable frontier: {target}")
+        dprint(f"[Exploration] Agent {agent.id} at {start} -> frontier {target}")
         return target
+
+    def _voronoi_frontier(self, internal_map, agent, active) -> Optional[GridPosition]:
+        """
+        Multi-source BFS over known-free cells from every active agent's cell.
+        Each cell is owned by its nearest agent (ties broken by lowest id, via
+        seeding order). Returns the nearest frontier owned by `agent`, or - if it
+        owns none - its nearest reachable frontier regardless of ownership.
+        """
+        height = len(internal_map)
+        width = len(internal_map[0])
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+        owner = {}
+        queue = deque()
+        # Seed in ascending id order so equidistant cells go to the lower id.
+        for a in sorted(active, key=lambda a: a.id):
+            cell = a._to_grid(a.believed_position)
+            cx, cy = cell
+            if 0 <= cx < width and 0 <= cy < height and cell not in owner:
+                owner[cell] = a.id
+                queue.append(cell)
+
+        my_start = agent._to_grid(agent.believed_position)
+        best = None  # nearest frontier owned by this agent (BFS order == distance)
+
+        while queue:
+            cx, cy = queue.popleft()
+            cell = (cx, cy)
+
+            if (best is None and owner[cell] == agent.id
+                    and cell != my_start and self.is_frontier(internal_map, cell)):
+                best = cell
+
+            for dx, dy in directions:
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                if (nx, ny) in owner:
+                    continue
+                # Expand only through known-free space so frontiers sit at the
+                # edge of a corridor the agent can actually traverse.
+                if self._is_free(internal_map[ny][nx]):
+                    owner[(nx, ny)] = owner[cell]
+                    queue.append((nx, ny))
+
+        if best is not None:
+            return best
+        # Own no frontier in our region: take the nearest reachable one anyway.
+        return self._nearest_reachable_frontier(internal_map, my_start)
 
     def _nearest_reachable_frontier(
         self,
@@ -78,22 +138,15 @@ class FrontierExploration:
         while queue:
             cx, cy = queue.popleft()
 
-            # The first frontier we reach is the nearest reachable one.
-            # (Skip the agent's own cell so we always pick something to move
-            # toward rather than a zero-length target.)
             if (cx, cy) != start and self.is_frontier(internal_map, (cx, cy)):
                 return (cx, cy)
 
             for dx, dy in directions:
                 nx, ny = cx + dx, cy + dy
-
                 if not (0 <= nx < width and 0 <= ny < height):
                     continue
                 if (nx, ny) in visited:
                     continue
-
-                # Only expand through cells we know are free, so every reached
-                # frontier sits at the edge of a corridor the agent can follow.
                 if self._is_free(internal_map[ny][nx]):
                     visited.add((nx, ny))
                     queue.append((nx, ny))

@@ -41,6 +41,10 @@ class CommunicationModel:
         Share information between agents.
         """
 
+        # "off" -> sharing handled elsewhere (e.g. a single shared map).
+        if self.mode == "off":
+            return
+
         for other in agents:
             if other.id == agent.id:
                 continue
@@ -52,11 +56,14 @@ class CommunicationModel:
             if self._packet_lost():
                 continue
 
-            # Send map
+            # Send map (optionally corrupted in transit)
             received_map = self._transmit_map(other.internal_map)
 
-            # Merge maps
-            self._merge_maps(agent.internal_map, received_map)
+            # Merge: adopt the peer's CONFIDENT (locked) cells only.
+            self._merge_maps(
+                agent.internal_map, agent.locked,
+                received_map, other.locked,
+            )
 
     # =========================
     # Communication Rules
@@ -119,14 +126,31 @@ class CommunicationModel:
     # Map Fusion
     # =========================
 
-    def _merge_maps(self, target_map, incoming_map):
+    def _merge_maps(self, target_map, target_locked, incoming_map, incoming_locked):
         """
-        Merge maps using averaging.
-        """
+        Confident-knowledge merge: adopt only the cells the sender has *locked*.
 
+        A cell locks (in the agent's own occupancy update) only after enough
+        consistent direct observations to saturate past the free/wall thresholds,
+        so a locked cell is the sender's confirmed, settled knowledge - not a
+        noisy half-observation. We copy those faithfully into any cell we have not
+        locked ourselves, and lock them (we now hold them as confident too). Cells
+        the sender is still unsure about are not shared at all.
+
+        This is what makes sharing safe. Earlier merges fused *unlocked*,
+        mid-accumulation values - which is precisely where corruption came from:
+        a transient low reading on a true wall would propagate and, gossiped
+        around, get locked as free, leaving agents driving into real walls. By
+        exchanging only settled cells (the same information a single shared map
+        would hold), the merged map stays as clean as each agent's own sensing.
+        """
         height = len(target_map)
         width = len(target_map[0])
 
         for y in range(height):
             for x in range(width):
-                target_map[y][x] = (target_map[y][x] + incoming_map[y][x]) / 2
+                if target_locked[y][x]:
+                    continue  # our own confident knowledge stands
+                if incoming_locked[y][x]:
+                    target_map[y][x] = incoming_map[y][x]
+                    target_locked[y][x] = True

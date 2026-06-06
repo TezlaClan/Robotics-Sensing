@@ -43,11 +43,28 @@ class BaseAgent:
         map_update_step: float = 0.1,
         map_lock_high: float = 0.9,
         map_lock_low: float = 0.1,
+        coordinator=None,
+        communication_range: float = 10.0,
+        swarm_slam: bool = False,
+        sensor_range_sigma: float = 0.0,
     ):
         self.id = agent_id
 
         self.radius = radius
         self.speed = speed
+
+        # =========================
+        # Multi-agent coordination
+        # =========================
+        # Shared blackboard (goal claim, frontier reservations, mission state).
+        if coordinator is None:
+            from communication.swarm_coordinator import SwarmCoordinator
+            coordinator = SwarmCoordinator()
+        self.coordinator = coordinator
+        self.communication_range = communication_range
+        self.swarm_slam = swarm_slam
+        # Noise std-dev applied to a synthesised inter-agent relative measurement.
+        self.sensor_range_sigma = sensor_range_sigma
 
         # Occupancy-grid update: small steps so a single noisy reading barely
         # moves a cell; a cell locks (stops updating) once it saturates past the
@@ -146,15 +163,19 @@ class BaseAgent:
         # tile rather than only to tile resolution.
         scan = self.sensor_model.range_scan(environment, self.true_position)
 
+        # Swarm SLAM: a confident in-range neighbour anchors our pose estimate.
+        anchors = self._gather_anchors(agents)
+
         self.believed_position = self.localization_model.update(
             self.believed_position,
             self.actual_motion,
             scan,
-            self.internal_map
+            self.internal_map,
+            anchors=anchors,
         )
 
         # 4. Planning
-        self._plan(environment)
+        self._plan(environment, agents)
 
         # 5. Movement
         self._move(dt, environment)
@@ -170,6 +191,58 @@ class BaseAgent:
 
         # 7. Check completion
         self._check_goal(environment)
+
+    # =========================
+    # Swarm SLAM: inter-agent pose anchoring
+    # =========================
+
+    def _gather_anchors(self, agents):
+        """
+        Build inter-agent pose anchors for collaborative localization.
+
+        For each peer within communication range that is meaningfully more
+        confident in its own pose than we are, synthesise a noisy relative
+        measurement of that peer (range/bearing style, using true positions as a
+        real sensor would) and turn it into an implied estimate of OUR pose:
+        ``implied = peer.believed_position - measured_offset``, weighted by the
+        peer's confidence. The particle filter folds these in as extra evidence.
+
+        Returns a list of ``(implied_position, weight)`` or None if swarm SLAM is
+        disabled, the localizer has no confidence notion, or no peer qualifies.
+        """
+        if not self.swarm_slam:
+            return None
+        my_conf_fn = getattr(self.localization_model, "confidence", None)
+        if my_conf_fn is None:
+            return None  # odometry / exact have no pose confidence to compare
+        my_conf = my_conf_fn()
+
+        margin = 0.1  # require a peer to be clearly more confident before trusting it
+        ax, ay = self.true_position
+        sigma = self.sensor_range_sigma
+
+        anchors = []
+        for other in agents:
+            if other.id == self.id:
+                continue
+            other_conf_fn = getattr(other.localization_model, "confidence", None)
+            if other_conf_fn is None:
+                continue
+            bx, by = other.true_position
+            if math.hypot(ax - bx, ay - by) > self.communication_range:
+                continue
+            other_conf = other_conf_fn()
+            if other_conf <= my_conf + margin:
+                continue
+            meas_dx = (bx - ax) + (self.rng.gauss(0, sigma) if sigma > 0 else 0.0)
+            meas_dy = (by - ay) + (self.rng.gauss(0, sigma) if sigma > 0 else 0.0)
+            implied = (
+                other.believed_position[0] - meas_dx,
+                other.believed_position[1] - meas_dy,
+            )
+            anchors.append((implied, other_conf))
+
+        return anchors if anchors else None
 
     # =========================
     # Internal Map Update
@@ -209,10 +282,12 @@ class BaseAgent:
     # Planning Logic
     # =========================
 
-    def _plan(self, environment):
+    def _plan(self, environment, agents=None):
         """
         Decide where to go next.
         """
+        if agents is None:
+            agents = [self]
         
         self.steps_since_replan += 1
 
@@ -252,7 +327,9 @@ class BaseAgent:
         if self.returning_to_start:
             self._set_fixed_target(environment.map.start)
 
-        elif self._goal_discovered(environment):
+        elif self._goal_discovered(environment) and self._claims_goal(agents, environment):
+            # We are the swarm's assigned goal-reacher: head straight for it.
+            # Every other agent keeps exploring/helping and never targets the goal.
             self._set_fixed_target(environment.map.goal)
 
         else:
@@ -272,7 +349,8 @@ class BaseAgent:
             if not target_still_valid:
                 self.current_target = self.exploration_strategy.choose_target(
                     self,
-                    self.internal_map
+                    self.internal_map,
+                    agents,
                 )
                 self.current_path = []
                 self.steps_since_replan = 0
@@ -411,6 +489,57 @@ class BaseAgent:
             return False
         return self.internal_map[gy][gx] < 0.4
 
+    def _claims_goal(self, agents, environment) -> bool:
+        """
+        Assign the goal to the nearest (by path) still-active agent if it is not
+        yet claimed, then report whether THIS agent is the claimer. The claim is
+        sticky (held in the coordinator), so once made it does not flip as agents
+        move. Only the claimer pursues the goal; everyone else keeps exploring.
+        """
+        coord = self.coordinator
+        if coord.goal_claimer is None:
+            goal_cell = environment.map.goal
+            best_id, best_d = None, float("inf")
+            for a in agents:
+                if getattr(a, "finished", False):
+                    continue
+                d = self._path_distance(
+                    a._to_grid(a.believed_position), goal_cell, a.internal_map
+                )
+                if d < best_d or (d == best_d and (best_id is None or a.id < best_id)):
+                    best_d, best_id = d, a.id
+            if best_id is not None:
+                coord.try_claim_goal(best_id)
+        return coord.goal_claimer == self.id
+
+    def _path_distance(self, start_cell, goal_cell, internal_map) -> float:
+        """
+        BFS step-distance from start_cell to goal_cell over non-wall cells
+        (prob < 0.6) on the given map. Returns inf if unreachable.
+        """
+        if start_cell == goal_cell:
+            return 0
+        w, h = self.map_width, self.map_height
+        sx, sy = start_cell
+        if not (0 <= sx < w and 0 <= sy < h):
+            return float("inf")
+
+        visited = {start_cell}
+        queue = deque([(sx, sy, 0)])
+        while queue:
+            cx, cy, d = queue.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < w and 0 <= ny < h) or (nx, ny) in visited:
+                    continue
+                if (nx, ny) == goal_cell:
+                    return d + 1
+                if internal_map[ny][nx] >= 0.6:  # wall
+                    continue
+                visited.add((nx, ny))
+                queue.append((nx, ny, d + 1))
+        return float("inf")
+
     # =========================
     # Movement Logic
     # =========================
@@ -528,13 +657,19 @@ class BaseAgent:
     def _check_goal(self, environment):
         current_cell = self._to_grid(self.true_position)
 
-        if not self.reached_goal and current_cell == environment.map.goal:
+        # Only the assigned claimer may "reach" the goal - this is what enforces
+        # that a single agent handles the goal and the return trip. Non-claimers
+        # may pass over the cell while helping, but it never counts.
+        is_claimer = (self.coordinator.goal_claimer == self.id)
+
+        if is_claimer and not self.reached_goal and current_cell == environment.map.goal:
             self.reached_goal = True
             self.returning_to_start = True
             self.current_path = []
 
         elif self.returning_to_start and current_cell == environment.map.start:
             self.finished = True
+            self.coordinator.mission_complete = True
 
     # =========================
     # Coordinate Helpers

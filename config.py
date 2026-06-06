@@ -16,7 +16,7 @@ CONFIG = {
     # =========================
     # Simulation
     # =========================
-    "max_steps": 2000,
+    "max_steps": 4000,
     "dt": 0.1,
 
     # Verbose console tracing (planner / exploration / agent / setup).
@@ -46,12 +46,33 @@ CONFIG = {
         "path": True,        # planned A* path
         "particles": True,   # SLAM particle cloud (orange), if using slam
         "agents": True,      # true (red) and believed (blue) agent positions
+        "links": True,       # faint lines between in-range (communicating) agents
     },
+
+    # =========================
+    # Multi-agent
+    # =========================
+    "num_agents": 3,             # number of cooperative agents in the swarm
+    # How agents share what they map:
+    #   "shared"     -> all agents read/write ONE global occupancy grid
+    #   "individual" -> each agent keeps its own grid, merged only when in range
+    "map_sharing": "individual",
+
+    # Communication (only meaningful when map_sharing == "individual")
+    "comm_mode": "local",        # "global" (always) or "local" (within range only)
+    "communication_range": 5.0, # cells; range for "local" comms and swarm anchoring
+    "comm_packet_loss": 0.1,     # chance a map transmission is dropped
+    "comm_corruption": 0.0,      # per-cell chance a transmitted value is corrupted
+
+    # Swarm SLAM: a confident agent's pose anchors a less-confident neighbour
+    # in range (collaborative localization).
+    "swarm_slam": True,
+    "slam_anchor_sigma": 1.0,    # cells; spread of an inter-agent relative measurement
 
     # =========================
     # Sensor
     # =========================
-    "sensor_range": 8,
+    "sensor_range": 3,
     "sensor_mode": "radius",  # "radius" or "los"
     "sensor_false_positive": 0.1,   # free cell reported as an obstacle
     "sensor_false_negative": 0.1,   # obstacle reported as free

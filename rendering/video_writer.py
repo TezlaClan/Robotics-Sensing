@@ -39,6 +39,7 @@ class VideoWriter:
         self.config = config = config or {}
 
         self.layers = config.get("render_layers", DEFAULT_LAYERS)
+        self.comm_range = config.get("communication_range", None)
         self.fps = config.get("video_fps", 30)
         self.dpi = config.get("video_dpi", 100)
 
@@ -148,7 +149,7 @@ class VideoWriter:
         if self._writer is None:
             return
 
-        draw_frame(self.ax, self.environment, self.agents, self.layers)
+        draw_frame(self.ax, self.environment, self.agents, self.layers, self.comm_range)
         self.fig.tight_layout()
         self.canvas.draw()
 

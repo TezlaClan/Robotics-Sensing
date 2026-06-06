@@ -55,6 +55,7 @@ class SLAMLocalization:
         max_endpoints: int = 24,
         alpha_slow: float = 0.01,
         alpha_fast: float = 0.2,
+        anchor_sigma: float = 1.0,
         rng_manager=None,
     ):
         """
@@ -75,6 +76,9 @@ class SLAMLocalization:
         self.init_sigma = init_sigma
         self.rough_sigma = rough_sigma
         self.max_endpoints = max_endpoints
+        # Spread (cells) of an inter-agent relative measurement, used when a
+        # confident neighbour anchors this filter (swarm SLAM).
+        self.anchor_sigma = anchor_sigma
 
         # Augmented-MCL recovery: track slow/fast averages of measurement fit and
         # inject random hypotheses when the fit collapses (filter divergence /
@@ -100,6 +104,7 @@ class SLAMLocalization:
         motion: Position,
         scan: List[RelObservation],
         internal_map: Optional[List[List[float]]] = None,
+        anchors: Optional[List[Tuple[Position, float]]] = None,
     ) -> Position:
         # 1. Lazy init around the (known) start pose.
         if self.particles is None:
@@ -109,8 +114,10 @@ class SLAMLocalization:
         self._predict(motion)
 
         # 3. Measurement update (requires the map).
+        #    `anchors` are implied-pose hints from confident neighbours (swarm
+        #    SLAM); they add evidence alongside the agent's own scan.
         if internal_map is not None:
-            self._weight(scan, internal_map)
+            self._weight(scan, internal_map, anchors)
             self._resample_if_needed(internal_map)
 
         # 4. Report the weighted-mean pose, kept out of known walls.
@@ -153,11 +160,15 @@ class SLAMLocalization:
     # 3. Measurement model (likelihood field)
     # =========================
 
-    def _weight(self, scan: List[RelObservation], internal_map):
+    def _weight(self, scan: List[RelObservation], internal_map, anchors=None):
         height = len(internal_map)
         width = len(internal_map[0])
 
         dist_field = self._distance_transform(internal_map, width, height)
+
+        # Swarm-SLAM anchor term: each (implied_pos, weight) rewards particles
+        # near a pose implied by a confident neighbour's relative measurement.
+        anchor_two_sigma_sq = 2.0 * self.anchor_sigma * self.anchor_sigma
 
         # Positive evidence: obstacle hits should land on map walls.
         hits = self._subsample([(dx, dy) for dx, dy, occ in scan if occ], self.max_endpoints)
@@ -204,6 +215,16 @@ class SLAMLocalization:
             ipx, ipy = int(px), int(py)
             if not (0 <= ipx < width and 0 <= ipy < height) or internal_map[ipy][ipx] > _WALL_THRESHOLD:
                 lw += log_wall_penalty
+
+            # Inter-agent anchors (added to the resampling weight only, NOT the
+            # fit, so they don't mask our own divergence). Scaled by the
+            # neighbour's confidence: a sure neighbour pulls harder. When our own
+            # scan is uninformative these terms dominate and the cloud snaps
+            # toward the neighbour's implied pose (collaborative recovery).
+            if anchors:
+                for (ax, ay), conf in anchors:
+                    d2 = (px - ax) ** 2 + (py - ay) ** 2
+                    lw += conf * (-d2 / anchor_two_sigma_sq)
 
             log_weights.append(lw)
 
@@ -431,3 +452,26 @@ class SLAMLocalization:
 
     def get_particles(self) -> List[List[float]]:
         return self.particles if self.particles is not None else []
+
+    def confidence(self) -> float:
+        """
+        How sure the filter is of its pose, in [0, 1]. Combines:
+          - cloud tightness: a concentrated cloud (small weighted spread) is
+            confident; a diffuse one is not.
+          - measurement fit (w_slow): the long-run scan-explanation quality, so a
+            tight-but-wrong cloud (good geometry, bad fit) is NOT reported as
+            confident and won't be trusted to anchor other agents.
+        """
+        if not self.particles or not self.weights:
+            return 0.0
+
+        mx = sum(w * p[0] for w, p in zip(self.weights, self.particles))
+        my = sum(w * p[1] for w, p in zip(self.weights, self.particles))
+        var = sum(
+            w * ((p[0] - mx) ** 2 + (p[1] - my) ** 2)
+            for w, p in zip(self.weights, self.particles)
+        )
+        spread = math.sqrt(max(0.0, var))
+        spread_term = math.exp(-spread)          # ~1 when tight, ->0 when diffuse
+        fit_term = max(0.0, min(1.0, self.w_slow))
+        return max(0.0, min(1.0, spread_term * fit_term))

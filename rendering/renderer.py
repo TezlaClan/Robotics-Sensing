@@ -18,6 +18,7 @@ class Renderer:
 
         config = config or {}
         self.layers = config.get("render_layers", DEFAULT_LAYERS)
+        self.comm_range = config.get("communication_range", None)
 
         h = environment.map.height
         w = environment.map.width
@@ -32,7 +33,7 @@ class Renderer:
         plt.show()
 
     def render(self):
-        draw_frame(self.ax, self.environment, self.agents, self.layers)
+        draw_frame(self.ax, self.environment, self.agents, self.layers, self.comm_range)
         plt.tight_layout()
         plt.pause(0.001)
 

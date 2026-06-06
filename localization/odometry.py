@@ -39,9 +39,13 @@ class OdometryLocalization:
         velocity: Position,
         observations=None,
         internal_map=None,
+        anchors=None,
     ) -> Position:
         """
         Update believed position using odometry + noise.
+
+        `anchors` (inter-agent pose hints) are accepted for a uniform localizer
+        interface but ignored - dead reckoning has no correction step.
         """
 
         
