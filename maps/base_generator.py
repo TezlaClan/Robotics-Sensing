@@ -150,3 +150,46 @@ class BaseMapGenerator(ABC):
         for y in range(max(0, y1), min(map_obj.height, y2)):
             for x in range(max(0, x1), min(map_obj.width, x2)):
                 map_obj.grid[y][x] = 0
+
+    def _keep_largest_region(self, map_obj: Map):
+        """
+        Flood-fill the free space and keep only the largest connected region,
+        walling off all smaller pockets. Guarantees the map is fully connected
+        (and therefore solvable) - useful for generators that can leave isolated
+        cavities, e.g. caves and scattered-obstacle fields.
+        """
+        from collections import deque
+
+        visited = [[False] * map_obj.width for _ in range(map_obj.height)]
+        largest = []
+
+        for sy in range(map_obj.height):
+            for sx in range(map_obj.width):
+                if map_obj.grid[sy][sx] != 0 or visited[sy][sx]:
+                    continue
+
+                # Flood-fill this connected free region
+                region = []
+                queue = deque([(sx, sy)])
+                visited[sy][sx] = True
+
+                while queue:
+                    x, y = queue.popleft()
+                    region.append((x, y))
+
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = x + dx, y + dy
+                        if (map_obj.in_bounds(nx, ny)
+                                and not visited[ny][nx]
+                                and map_obj.grid[ny][nx] == 0):
+                            visited[ny][nx] = True
+                            queue.append((nx, ny))
+
+                if len(region) > len(largest):
+                    largest = region
+
+        keep = set(largest)
+        for y in range(map_obj.height):
+            for x in range(map_obj.width):
+                if map_obj.grid[y][x] == 0 and (x, y) not in keep:
+                    map_obj.set_cell(x, y, 1)

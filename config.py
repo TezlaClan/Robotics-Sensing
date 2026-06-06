@@ -8,9 +8,10 @@ CONFIG = {
     # =========================
     # Map
     # =========================
-    "map_width": 31,
-    "map_height": 31,
-    "map_type": "maze",  # "maze", "room", "mixed"
+    "map_width": 41,
+    "map_height": 41,
+    # "maze", "room", "mixed", "cave", "obstacle", "bsp"
+    "map_type": "bsp",
 
     # =========================
     # Simulation

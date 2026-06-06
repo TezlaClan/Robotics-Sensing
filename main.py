@@ -18,6 +18,9 @@ from core.agent import create_agent
 from maps.maze_generator import MazeGenerator
 from maps.room_generator import RoomGenerator
 from maps.mixed_generator import MixedGenerator
+from maps.cave_generator import CaveGenerator
+from maps.obstacle_generator import ObstacleGenerator
+from maps.bsp_generator import BSPGenerator
 
 
 def create_map(config, rng_manager):
@@ -31,18 +34,21 @@ def create_map(config, rng_manager):
     map_type = config["map_type"]
     dprint(f"   Generating {map_type} map ({width}x{height})...")
 
-    if map_type == "maze":
-        generator = MazeGenerator(width, height, rng_manager)
+    generators = {
+        "maze": MazeGenerator,
+        "room": RoomGenerator,
+        "mixed": MixedGenerator,
+        "cave": CaveGenerator,
+        "obstacle": ObstacleGenerator,
+        "bsp": BSPGenerator,
+    }
 
-    elif map_type == "room":
-        generator = RoomGenerator(width, height, rng_manager)
+    if map_type not in generators:
+        raise ValueError(
+            f"Unknown map type: {map_type}. Options: {', '.join(generators)}"
+        )
 
-    elif map_type == "mixed":
-        generator = MixedGenerator(width, height, rng_manager)
-
-    else:
-        raise ValueError(f"Unknown map type: {map_type}")
-
+    generator = generators[map_type](width, height, rng_manager)
     return generator.generate()
 
 
