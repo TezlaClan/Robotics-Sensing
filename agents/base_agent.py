@@ -15,6 +15,7 @@ Responsibilities:
 """
 
 from typing import Tuple, List, Optional
+from collections import deque
 import math
 
 from utils.debug import dprint
@@ -39,11 +40,21 @@ class BaseAgent:
         rng_manager,
         radius,
         speed,
+        map_update_step: float = 0.1,
+        map_lock_high: float = 0.9,
+        map_lock_low: float = 0.1,
     ):
         self.id = agent_id
 
         self.radius = radius
         self.speed = speed
+
+        # Occupancy-grid update: small steps so a single noisy reading barely
+        # moves a cell; a cell locks (stops updating) once it saturates past the
+        # high/low thresholds, having seen enough consistent evidence.
+        self.map_update_step = map_update_step
+        self.map_lock_high = map_lock_high
+        self.map_lock_low = map_lock_low
 
         # =========================
         # True State
@@ -66,6 +77,13 @@ class BaseAgent:
         # =========================
         self.internal_map = [
             [0.5 for _ in range(map_width)]
+            for _ in range(map_height)
+        ]
+
+        # Cells that have accumulated enough consistent evidence are "locked"
+        # and no longer updated, so noise can't flip a confidently-known cell.
+        self.locked = [
+            [False for _ in range(map_width)]
             for _ in range(map_height)
         ]
 
@@ -92,6 +110,10 @@ class BaseAgent:
         self.steps_since_replan = 0
         self.replan_interval = 5  # Replan every 5 steps
 
+        # Stuck detection / recovery
+        self.stuck_steps = 0
+        self.stuck_limit = 25  # consecutive no-progress steps before recovering
+
         # =========================
         # Status Flags
         # =========================
@@ -108,20 +130,26 @@ class BaseAgent:
         Main per-timestep update.
         """
 
-        # 1. Sense environment
+        # 1. Sense environment (observations are absolute world cells)
         observations = self.sensor_model.sense(
             environment,
             self.true_position
         )
 
-        # 2. Update internal map
+        # 2. Update internal map (uses absolute cells -> map stays world-aligned)
         self._update_internal_map(observations)
 
-        # 3. Update localization
+        # 3. Update localization.
+        # A real range sensor reports hits relative to itself as continuous
+        # ranges. Casting from the true *floating-point* position means the scan
+        # depends on the sub-tile position, so the filter can localize WITHIN a
+        # tile rather than only to tile resolution.
+        scan = self.sensor_model.range_scan(environment, self.true_position)
+
         self.believed_position = self.localization_model.update(
             self.believed_position,
             self.actual_motion,
-            observations,
+            scan,
             self.internal_map
         )
 
@@ -130,6 +158,12 @@ class BaseAgent:
 
         # 5. Movement
         self._move(dt, environment)
+
+        # Track lack of progress so _plan can trigger recovery if we get stuck.
+        if math.hypot(self.actual_motion[0], self.actual_motion[1]) < 1e-6:
+            self.stuck_steps += 1
+        else:
+            self.stuck_steps = 0
 
         # 6. Communication
         self.communication_model.communicate(self, agents)
@@ -145,16 +179,31 @@ class BaseAgent:
         """
         Update occupancy grid using sensor observations.
 
+        Each observation nudges a cell by a small step, so a single false
+        reading barely moves it - several consistent readings are needed to
+        cross the free/wall thresholds. Once a cell saturates past the lock
+        thresholds it is locked and no longer updated, immune to later noise.
+
         observations expected format:
         List of (x, y, occupied: bool)
         """
 
+        step = self.map_update_step
+
         for x, y, occupied in observations:
-            if 0 <= x < self.map_width and 0 <= y < self.map_height:
-                if occupied:
-                    self.internal_map[y][x] = min(1.0, self.internal_map[y][x] + 0.2)
-                else:
-                    self.internal_map[y][x] = max(0.0, self.internal_map[y][x] - 0.2)
+            if not (0 <= x < self.map_width and 0 <= y < self.map_height):
+                continue
+            if self.locked[y][x]:
+                continue
+
+            if occupied:
+                self.internal_map[y][x] = min(1.0, self.internal_map[y][x] + step)
+            else:
+                self.internal_map[y][x] = max(0.0, self.internal_map[y][x] - step)
+
+            prob = self.internal_map[y][x]
+            if prob >= self.map_lock_high or prob <= self.map_lock_low:
+                self.locked[y][x] = True
 
     # =========================
     # Planning Logic
@@ -168,6 +217,30 @@ class BaseAgent:
         self.steps_since_replan += 1
 
         agent_cell = self._to_grid(self.believed_position)
+        recovery = False  # set when pushing through believed-walls to escape a seal
+
+        # =========================
+        # Recovery if frozen too long (any mission phase)
+        # =========================
+        if self.stuck_steps >= self.stuck_limit:
+            self.stuck_steps = 0
+            # 0. Unlock every cell so a wrongly-locked value can't keep us stuck;
+            #    sensing will re-establish locks as evidence re-accumulates.
+            self._unlock_all()
+            # 1. Re-open the believed-walls bounding our region. Clears a phantom
+            #    (noisy false-positive) wall that sealed us in; real walls get
+            #    re-confirmed by sensing.
+            self._reopen_boundary(agent_cell)
+            # 2. Take one real step into a sensed-free neighbour. This breaks a
+            #    physical deadlock (e.g. a wrong pose estimate left us following an
+            #    un-followable path, including while heading to the goal/start) and
+            #    yields fresh observations to relocalize from.
+            step_cell = self._recovery_step(environment)
+            if step_cell is not None:
+                self.current_target = step_cell
+                self.current_path = [step_cell]
+                self.steps_since_replan = 0
+                return
 
         # =========================
         # Mission phase target selection
@@ -205,7 +278,14 @@ class BaseAgent:
                 self.steps_since_replan = 0
 
                 if self.current_target is None:
-                    dprint(f"[Agent {self.id}] No target selected by exploration strategy")
+                    # Still no reachable frontier: head to the nearest unexplored
+                    # cell, allowing the path to cross believed-walls.
+                    self.current_target = self.exploration_strategy.nearest_unknown(
+                        self.internal_map, agent_cell
+                    )
+                    recovery = self.current_target is not None
+                    if self.current_target is None:
+                        dprint(f"[Agent {self.id}] No target (exploration complete?)")
 
         # =========================
         # Path (re)planning to the committed target
@@ -224,7 +304,8 @@ class BaseAgent:
             self.current_path = self.planner.plan(
                 agent_cell,
                 self.current_target,
-                self.internal_map
+                self.internal_map,
+                allow_walls=recovery
             )
 
             if self.current_path:
@@ -241,6 +322,73 @@ class BaseAgent:
         if checker is None:
             return True
         return checker(self.internal_map, target)
+
+    def _reopen_boundary(self, agent_cell) -> int:
+        """
+        Recovery for being stuck: flood-fill the reachable known-free region and
+        reset the believed-walls on its boundary to 'unknown'. This re-opens any
+        phantom wall (a noisy false positive) that sealed us in. Cells the sensor
+        can still see snap back to wall almost immediately, so real walls are not
+        forgotten; the genuine phantom (out of sight) stays open and lets us out.
+        Returns how many cells were reopened.
+        """
+        w, h = self.map_width, self.map_height
+        sx, sy = agent_cell
+        if not (0 <= sx < w and 0 <= sy < h):
+            return 0
+
+        visited = {agent_cell}
+        queue = deque([agent_cell])
+        boundary = set()
+
+        while queue:
+            cx, cy = queue.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < w and 0 <= ny < h) or (nx, ny) in visited:
+                    continue
+                prob = self.internal_map[ny][nx]
+                if prob < 0.4:          # known free -> keep expanding the region
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+                elif prob > 0.6:        # believed wall on the boundary
+                    boundary.add((nx, ny))
+
+        for bx, by in boundary:
+            self.internal_map[by][bx] = 0.5  # reset to unknown
+
+        return len(boundary)
+
+    def _unlock_all(self):
+        """Clear all cell locks (recovery safety net)."""
+        for row in self.locked:
+            for x in range(len(row)):
+                row[x] = False
+
+    def _recovery_step(self, environment):
+        """
+        Pick a free neighbouring cell to physically step into when stuck, to
+        break a deadlock and generate fresh observations. Prefers still-unknown
+        neighbours so the twitch also makes exploration progress.
+        """
+        tcx = int(self.true_position[0])
+        tcy = int(self.true_position[1])
+
+        free = []
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = tcx + dx, tcy + dy
+            if environment.is_free(nx, ny):
+                free.append((nx, ny))
+
+        if not free:
+            return None
+
+        unknown = [
+            c for c in free
+            if 0.4 <= self.internal_map[c[1]][c[0]] <= 0.6
+        ]
+        pool = unknown if unknown else free
+        return self.rng.choice(pool)
 
     def _set_fixed_target(self, cell):
         """

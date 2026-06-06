@@ -1,21 +1,35 @@
 """
 sensor_model.py
 
-Field-of-view sensor with line-of-sight occlusion.
+Two complementary outputs from one sensor:
 
-The agent observes cells within sensor_range, but cannot see through walls or
-around corners: walls cast shadows that hide everything behind them. Visibility
-is computed with recursive shadowcasting (the standard roguelike FOV algorithm)
-across 8 octants, so the agent sees the wall faces in front of it but nothing
-beyond.
+1. sense()       - cell field-of-view for MAPPING. Recursive shadowcasting over
+                   the grid gives the visible cells (occluded by walls); each is
+                   reported with its (noisy) occupancy. Resolution is per-cell,
+                   which is exactly what an occupancy grid needs.
+
+2. range_scan()  - continuous range finder for LOCALIZATION. Rays are cast from
+                   the agent's *floating-point* position and return sub-cell hit
+                   distances. This is what lets SLAM localize WITHIN a tile: the
+                   measured ranges depend on where the robot actually is, not just
+                   which tile it occupies.
+
+Error models (all independent, default off):
+  - false_positive_rate : a free cell is reported as an obstacle (mapping)
+  - false_negative_rate : an obstacle is missed (mapping + a dropped ray)
+  - range_sigma         : Gaussian error on each measured range (range finder)
+  - range_outlier_rate  : chance a ray is a gross outlier (specular / mixed pixel)
 """
 
+import math
 from typing import List, Tuple
 
 from sensing.fov import visible_cells
 
 Position = Tuple[float, float]
 Observation = Tuple[int, int, bool]
+# Relative range-scan reading: (dx, dy) float offset from the sensor, occupied?
+ScanReading = Tuple[float, float, bool]
 
 
 class SensorModel:
@@ -25,6 +39,9 @@ class SensorModel:
         mode: str = "radius",
         false_positive_rate: float = 0.0,
         false_negative_rate: float = 0.0,
+        range_sigma: float = 0.0,
+        range_outlier_rate: float = 0.0,
+        num_beams: int = 72,
         rng_manager=None,
     ):
         self.sensor_range = sensor_range
@@ -32,16 +49,19 @@ class SensorModel:
 
         self.false_positive_rate = false_positive_rate
         self.false_negative_rate = false_negative_rate
+        self.range_sigma = range_sigma
+        self.range_outlier_rate = range_outlier_rate
+        self.num_beams = num_beams
 
         self.rng = rng_manager.behaviour_rng() if rng_manager else None
 
     # =========================
-    # Main API
+    # Mapping: cell field-of-view
     # =========================
 
     def sense(self, environment, position: Position) -> List[Observation]:
         """
-        Return observations for every cell currently visible to the agent.
+        Occupancy of every cell currently visible to the agent (for mapping).
         Cells hidden behind walls (shadowed) are not reported.
         """
         cx, cy = int(position[0]), int(position[1])
@@ -50,13 +70,17 @@ class SensorModel:
         observations = []
         for x, y in self._visible_cells(environment, cx, cy, radius):
             true_occ = not environment.is_free(x, y)
-            observations.append((x, y, self._noise(true_occ)))
+
+            if true_occ:
+                # Missed detection -> report as free.
+                reported = not (self.rng is not None and self.rng.random() < self.false_negative_rate)
+                observations.append((x, y, reported))
+            else:
+                # Spurious detection -> free cell reported as an obstacle.
+                spurious = self.rng is not None and self.rng.random() < self.false_positive_rate
+                observations.append((x, y, spurious))
 
         return observations
-
-    # =========================
-    # Field of view
-    # =========================
 
     def _visible_cells(self, environment, cx, cy, radius) -> set:
         """Cells visible from (cx, cy) within radius, occluded by walls."""
@@ -67,18 +91,99 @@ class SensorModel:
         )
 
     # =========================
-    # Noise
+    # Localization: continuous range scan
     # =========================
 
-    def _noise(self, truth: bool) -> bool:
-        if self.rng is None:
-            return truth
+    def range_scan(self, environment, position: Position) -> List[ScanReading]:
+        """
+        Cast num_beams rays from the CONTINUOUS position and return relative
+        readings (dx, dy, occupied) as floats.
 
-        if truth:
-            if self.rng.random() < self.false_negative_rate:
-                return False
+        Obstacle hits carry sub-cell geometry (the range depends on the exact
+        position within the tile), and each ray also contributes a free reading
+        partway along it as negative evidence.
+        """
+        ox, oy = position
+        max_r = float(self.sensor_range)
+        scan: List[ScanReading] = []
+
+        for i in range(self.num_beams):
+            ang = 2.0 * math.pi * i / self.num_beams
+            ux, uy = math.cos(ang), math.sin(ang)
+
+            hit_range = self._cast_ray(environment, ox, oy, ux, uy, max_r)
+
+            # No obstacle in range, or a missed detection -> free out to max range.
+            missed = self.rng is not None and self.rng.random() < self.false_negative_rate
+            if hit_range is None or missed:
+                scan.append((ux * max_r, uy * max_r, False))
+                continue
+
+            # Free space the ray passed through is reliable geometry, so derive
+            # it from the TRUE range; only the obstacle endpoint carries range
+            # noise (otherwise an overshooting reading would mark a real wall as
+            # free and create false evidence against the true pose).
+            if hit_range > 1.0:
+                fr = hit_range * 0.5
+                scan.append((ux * fr, uy * fr, False))           # free space before it
+
+            r = self._noisy_range(hit_range, max_r)
+            scan.append((ux * r, uy * r, True))                  # obstacle endpoint
+
+        return scan
+
+    def _cast_ray(self, environment, ox, oy, ux, uy, max_r):
+        """
+        DDA grid traversal from a continuous origin. Returns the distance to the
+        first obstacle surface, or None if nothing is hit within max_r.
+        """
+        cx, cy = int(ox), int(oy)
+        if not environment.is_free(cx, cy):
+            return 0.0
+
+        if ux != 0:
+            step_x = 1 if ux > 0 else -1
+            bx = (cx + 1) if ux > 0 else cx
+            t_max_x = (bx - ox) / ux
+            t_delta_x = abs(1.0 / ux)
         else:
-            if self.rng.random() < self.false_positive_rate:
-                return True
+            step_x = 0
+            t_max_x = float("inf")
+            t_delta_x = float("inf")
 
-        return truth
+        if uy != 0:
+            step_y = 1 if uy > 0 else -1
+            by = (cy + 1) if uy > 0 else cy
+            t_max_y = (by - oy) / uy
+            t_delta_y = abs(1.0 / uy)
+        else:
+            step_y = 0
+            t_max_y = float("inf")
+            t_delta_y = float("inf")
+
+        while True:
+            if t_max_x < t_max_y:
+                cx += step_x
+                t = t_max_x
+                t_max_x += t_delta_x
+            else:
+                cy += step_y
+                t = t_max_y
+                t_max_y += t_delta_y
+
+            if t > max_r:
+                return None
+            if not environment.map.in_bounds(cx, cy):
+                return None
+            if not environment.is_free(cx, cy):
+                return t
+
+    def _noisy_range(self, r, max_r):
+        """Apply range-finder noise to a measured distance."""
+        if self.rng is None:
+            return r
+        if self.range_outlier_rate > 0 and self.rng.random() < self.range_outlier_rate:
+            return self.rng.uniform(0.0, max_r)
+        if self.range_sigma > 0:
+            return max(0.0, r + self.rng.gauss(0, self.range_sigma))
+        return r

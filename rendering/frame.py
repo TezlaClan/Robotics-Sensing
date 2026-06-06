@@ -20,6 +20,7 @@ DEFAULT_LAYERS = {
     "tint": True,
     "start_goal": True,
     "path": True,
+    "particles": True,
     "agents": True,
 }
 
@@ -103,6 +104,25 @@ def draw_frame(ax, environment, agents, layers=None):
                 xs = [c[0] + 0.5 for c in agent.current_path]
                 ys = [c[1] + 0.5 for c in agent.current_path]
                 ax.plot(xs, ys, 'cyan', linewidth=2.5, alpha=0.6, zorder=2)
+
+    # =========================
+    # 5b. Localization particle cloud (if the localizer exposes one)
+    # =========================
+    if layers.get("particles", True):
+        for agent in agents:
+            get_particles = getattr(
+                getattr(agent, "localization_model", None), "get_particles", None
+            )
+            if get_particles is None:
+                continue
+            particles = get_particles()
+            if not particles:
+                continue
+            ax.scatter(
+                [p[0] for p in particles],
+                [p[1] for p in particles],
+                c='orange', s=4, alpha=0.35, zorder=2, linewidths=0,
+            )
 
     # =========================
     # 6. Agents (true = red, believed = blue)

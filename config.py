@@ -11,12 +11,12 @@ CONFIG = {
     "map_width": 41,
     "map_height": 41,
     # "maze", "room", "mixed", "cave", "obstacle", "bsp"
-    "map_type": "cave",
+    "map_type": "maze",
 
     # =========================
     # Simulation
     # =========================
-    "max_steps": 20000,
+    "max_steps": 2000,
     "dt": 0.1,
 
     # Verbose console tracing (planner / exploration / agent / setup).
@@ -44,6 +44,7 @@ CONFIG = {
         "tint": True,        # red/green tint on known wall/free cells
         "start_goal": True,  # start and goal markers
         "path": True,        # planned A* path
+        "particles": True,   # SLAM particle cloud (orange), if using slam
         "agents": True,      # true (red) and believed (blue) agent positions
     },
 
@@ -52,16 +53,33 @@ CONFIG = {
     # =========================
     "sensor_range": 8,
     "sensor_mode": "radius",  # "radius" or "los"
-    "sensor_false_positive": 0.0,
-    "sensor_false_negative": 0.0,
+    "sensor_false_positive": 0.1,   # free cell reported as an obstacle
+    "sensor_false_negative": 0.1,   # obstacle reported as free
+    "sensor_range_sigma": 0.1,      # Gaussian range-finding error (cells) on hits
+    "sensor_range_outlier_rate": 0.1,  # chance of a gross range outlier per hit
+    "sensor_num_beams": 72,         # rays cast for the localization range scan
 
     # =========================
     # Localization
     # =========================
-    "localization": "slam",   # "odometry", "slam", "exact"
-    "odometry_noise": 0.1,    # per-step drift std-dev (used by odometry + slam)
-    "slam_search_radius": 3,  # cells searched around the odometry prediction
-    "slam_gain": 0.5,         # 0..1 pull toward the scan match (0 disables correction)
+    "localization": "slam",      # "odometry", "slam", "exact"
+    "odometry_noise": 0.1,       # per-step drift std-dev for the "odometry" localizer
+    # SLAM = Monte Carlo Localization (particle filter)
+    "slam_motion_sigma": 0.02,   # particle process noise (keep small: too much makes
+                                 #   the estimate wander along corridors)
+    "slam_num_particles": 200,   # particle cloud size
+    "slam_measurement_sigma": 1.2,  # likelihood-field std-dev in cells (larger = more forgiving)
+    "slam_z_rand": 0.1,          # uniform-noise floor for outlier robustness (0..1)
+
+    # =========================
+    # Mapping (occupancy grid)
+    # =========================
+    # Each observation nudges a cell by map_update_step (smaller = more evidence
+    # needed, more robust to false readings). A cell locks (stops updating) once
+    # it saturates at/above map_lock_high (wall) or at/below map_lock_low (free).
+    "map_update_step": 0.1,
+    "map_lock_high": 0.9,
+    "map_lock_low": 0.1,
 
     # =========================
     # Seeds

@@ -100,6 +100,43 @@ class FrontierExploration:
 
         return None
 
+    def nearest_unknown(
+        self,
+        internal_map: List[List[float]],
+        start: GridPosition,
+    ) -> Optional[GridPosition]:
+        """
+        Nearest unexplored cell, searching through ALL cells (walls included).
+
+        Used for recovery when no frontier is reachable through known-free space
+        - typically because a noisy false-positive reading sealed off the known
+        region with a phantom wall. The agent heads here through believed-walls;
+        real walls block in movement and phantom ones get corrected on the way.
+        """
+        height = len(internal_map)
+        width = len(internal_map[0])
+
+        sx, sy = start
+        if not (0 <= sx < width and 0 <= sy < height):
+            return None
+
+        visited = {start}
+        queue = deque([start])
+
+        while queue:
+            cx, cy = queue.popleft()
+
+            if (cx, cy) != start and self._is_unknown(internal_map[cy][cx]):
+                return (cx, cy)
+
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < width and 0 <= ny < height and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+
+        return None
+
     def is_frontier(self, internal_map, cell) -> bool:
         """
         Check whether a single cell is still a frontier:

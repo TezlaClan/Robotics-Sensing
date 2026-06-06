@@ -31,9 +31,15 @@ class AStarPlanner:
         start: GridPosition,
         goal: GridPosition,
         internal_map: List[List[float]],
+        allow_walls: bool = False,
     ) -> List[GridPosition]:
         """
         Compute path from start to goal.
+
+        allow_walls: recovery mode. When True, believed-walls are traversable at
+        a high cost, so the agent can push through a *suspected* wall (e.g. a
+        noisy false-positive that sealed a corridor). Real walls still block in
+        movement, so this is safe; phantom walls get re-observed and corrected.
         """
 
         height = len(internal_map)
@@ -74,8 +80,8 @@ class AStarPlanner:
                 dprint(f"[A*] Path found in {iterations} iterations: {len(path)} cells")
                 return path
 
-            for neighbour in self._get_neighbours(current, internal_map):
-                tentative_g = g_score[current] + self._cost(neighbour, internal_map)
+            for neighbour in self._get_neighbours(current, internal_map, allow_walls):
+                tentative_g = g_score[current] + self._cost(neighbour, internal_map, allow_walls)
 
                 if neighbour not in g_score or tentative_g < g_score[neighbour]:
                   came_from[neighbour] = current
@@ -111,6 +117,7 @@ class AStarPlanner:
         self,
         node: GridPosition,
         internal_map: List[List[float]],
+        allow_walls: bool = False,
     ) -> List:
       x, y = node
       width = len(internal_map[0])
@@ -128,7 +135,7 @@ class AStarPlanner:
           nx, ny = x + dx, y + dy
 
           if 0 <= nx < width and 0 <= ny < height:
-              if not self._is_blocked(nx, ny, internal_map, inflation_radius):
+              if allow_walls or not self._is_blocked(nx, ny, internal_map, inflation_radius):
                   neighbours.append((nx, ny))
 
       if not neighbours:
@@ -147,7 +154,7 @@ class AStarPlanner:
     # Cost Function
     # =========================
 
-    def _cost(self, node: GridPosition, internal_map) -> float:
+    def _cost(self, node: GridPosition, internal_map, allow_walls: bool = False) -> float:
         """
         Uniform cost - all free cells cost the same.
         This encourages shortest path, not wall-hugging.
@@ -155,9 +162,10 @@ class AStarPlanner:
         x, y = node
         prob = internal_map[y][x]
 
-        # Hard block
+        # Believed wall: impassable normally, but very expensive (not infinite)
+        # in recovery mode so a free route is always preferred when one exists.
         if prob > 0.6:
-            return float("inf")
+            return 1000.0 if allow_walls else float("inf")
 
         # All free/unknown cells have equal cost
         return 1.0

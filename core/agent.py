@@ -26,10 +26,11 @@ def _create_localization(config, rng_manager):
         )
     elif kind == "slam":
         return SLAMLocalization(
-            noise_sigma=config["odometry_noise"],
+            noise_sigma=config.get("slam_motion_sigma", 0.05),
             sensor_range=config["sensor_range"],
-            search_radius=config.get("slam_search_radius", 3),
-            gain=config.get("slam_gain", 0.5),
+            num_particles=config.get("slam_num_particles", 200),
+            measurement_sigma=config.get("slam_measurement_sigma", 1.2),
+            z_rand=config.get("slam_z_rand", 0.1),
             rng_manager=rng_manager,
         )
     elif kind == "exact":
@@ -53,6 +54,9 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         mode=config["sensor_mode"],
         false_positive_rate=config["sensor_false_positive"],
         false_negative_rate=config["sensor_false_negative"],
+        range_sigma=config.get("sensor_range_sigma", 0.0),
+        range_outlier_rate=config.get("sensor_range_outlier_rate", 0.0),
+        num_beams=config.get("sensor_num_beams", 72),
         rng_manager=rng_manager
     )
 
@@ -96,7 +100,10 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         communication_model=communication,
         rng_manager=rng_manager,
         radius=config["agent_radius"],
-        speed=config["agent_speed"]
+        speed=config["agent_speed"],
+        map_update_step=config.get("map_update_step", 0.1),
+        map_lock_high=config.get("map_lock_high", 0.9),
+        map_lock_low=config.get("map_lock_low", 0.1),
     )
 
     return agent
