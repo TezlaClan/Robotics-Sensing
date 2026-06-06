@@ -17,6 +17,8 @@ Responsibilities:
 from typing import Tuple, List, Optional
 import math
 
+from utils.debug import dprint
+
 
 Position = Tuple[float, float]
 GridPosition = Tuple[int, int]
@@ -164,35 +166,101 @@ class BaseAgent:
         
         self.steps_since_replan += 1
 
-        # Replan if: no path, reached target, or time to replan
-        should_replan = (
-            not self.current_path or 
+        agent_cell = self._to_grid(self.believed_position)
+
+        # =========================
+        # Mission phase target selection
+        # =========================
+        # 1. After reaching the goal: head back to the start.
+        # 2. Once the goal has been discovered (sensed): head straight for it
+        #    instead of continuing to explore.
+        # 3. Otherwise: keep exploring frontiers.
+        if self.returning_to_start:
+            self._set_fixed_target(environment.map.start)
+
+        elif self._goal_discovered(environment):
+            self._set_fixed_target(environment.map.goal)
+
+        else:
+            # =========================
+            # Frontier exploration (with commitment)
+            # =========================
+            # Keep heading to the current target until we actually reach it or it
+            # stops being a frontier (its unknown neighbours have been sensed).
+            # Re-picking a target every replan causes oscillation: the "nearest"
+            # frontier flips as the agent moves between two of them.
+            target_still_valid = (
+                self.current_target is not None and
+                agent_cell != self.current_target and
+                self._target_is_frontier(self.current_target)
+            )
+
+            if not target_still_valid:
+                self.current_target = self.exploration_strategy.choose_target(
+                    self,
+                    self.internal_map
+                )
+                self.current_path = []
+                self.steps_since_replan = 0
+
+                if self.current_target is None:
+                    dprint(f"[Agent {self.id}] No target selected by exploration strategy")
+
+        # =========================
+        # Path (re)planning to the committed target
+        # =========================
+        # Recompute the path periodically or when we don't have one, but do NOT
+        # change the target here.
+        need_path = (
+            not self.current_path or
             self.steps_since_replan >= self.replan_interval
         )
-        
-        if should_replan:
+
+        if need_path and self.current_target:
             self.steps_since_replan = 0
-            self.current_target = self.exploration_strategy.choose_target(
-                self,
+            dprint(f"[Agent {self.id}] Planning: start={agent_cell}, target={self.current_target}")
+
+            self.current_path = self.planner.plan(
+                agent_cell,
+                self.current_target,
                 self.internal_map
             )
 
-            if self.current_target:
-                start = self._to_grid(self.believed_position)
-                print(f"[Agent {self.id}] Planning: start={start}, target={self.current_target}")
-
-                self.current_path = self.planner.plan(
-                    start,
-                    self.current_target,
-                    self.internal_map
-                )
-                
-                if self.current_path:
-                    print(f"[Agent {self.id}] Path found: {len(self.current_path)} cells")
-                else:
-                    print(f"[Agent {self.id}] No path found!")
+            if self.current_path:
+                dprint(f"[Agent {self.id}] Path found: {len(self.current_path)} cells")
             else:
-                print(f"[Agent {self.id}] No target selected by exploration strategy")
+                dprint(f"[Agent {self.id}] No path found!")
+
+    def _target_is_frontier(self, target) -> bool:
+        """
+        Ask the exploration strategy whether `target` is still a frontier.
+        Falls back to True for strategies that don't expose this check.
+        """
+        checker = getattr(self.exploration_strategy, "is_frontier", None)
+        if checker is None:
+            return True
+        return checker(self.internal_map, target)
+
+    def _set_fixed_target(self, cell):
+        """
+        Lock navigation onto a fixed cell (the goal or start). Resets the path
+        only when the target actually changes, so direct navigation replans on
+        the normal interval rather than every step.
+        """
+        if self.current_target != cell:
+            self.current_target = cell
+            self.current_path = []
+            self.steps_since_replan = 0
+
+    def _goal_discovered(self, environment) -> bool:
+        """
+        True once the goal cell has been sensed as free in the internal map,
+        i.e. the agent has actually "found" the goal during exploration.
+        """
+        gx, gy = environment.map.goal
+        if not (0 <= gx < self.map_width and 0 <= gy < self.map_height):
+            return False
+        return self.internal_map[gy][gx] < 0.4
 
     # =========================
     # Movement Logic
@@ -211,7 +279,7 @@ class BaseAgent:
           x, y = next_cell
 
           if not environment.is_free(x, y):
-              print(f"[Agent {self.id}] Path blocked at {next_cell}, clearing path")
+              dprint(f"[Agent {self.id}] Path blocked at {next_cell}, clearing path")
               self.current_path = []
 
       # =========================
@@ -239,7 +307,7 @@ class BaseAgent:
       # 4. Close enough → advance path
       # =========================
       if dist < 0.1:
-          print(f"[Agent {self.id}] Reached waypoint {target_cell}, advancing path ({len(self.current_path)} remaining)")
+          dprint(f"[Agent {self.id}] Reached waypoint {target_cell}, advancing path ({len(self.current_path)} remaining)")
           self.current_path.pop(0)
           self.velocity = (0.0, 0.0)
           self.actual_motion = (0.0, 0.0)
@@ -284,7 +352,7 @@ class BaseAgent:
               moved = True
           
           if not moved:
-              print(f"[Agent {self.id}] BLOCKED: Cannot move from ({old_x:.1f}, {old_y:.1f}) toward waypoint {target_cell}")
+              dprint(f"[Agent {self.id}] BLOCKED: Cannot move from ({old_x:.1f}, {old_y:.1f}) toward waypoint {target_cell}")
 
       # =========================
       # 8. Apply movement

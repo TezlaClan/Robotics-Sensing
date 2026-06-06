@@ -1,0 +1,6 @@
+matplotlib
+numpy
+# Video recording (config["render_video"] = True). imageio-ffmpeg bundles a
+# static ffmpeg binary, so no system ffmpeg install is needed.
+imageio
+imageio-ffmpeg

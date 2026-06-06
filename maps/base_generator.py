@@ -14,6 +14,7 @@ from typing import Optional
 
 from core.map import Map
 from utils.random_manager import RandomManager
+from utils.debug import dprint
 
 
 class BaseMapGenerator(ABC):
@@ -93,7 +94,7 @@ class BaseMapGenerator(ABC):
             if start_clear and goal_clear:
                 map_obj.set_start(start)
                 map_obj.set_goal(goal)
-                print(f"Start/Goal placed successfully at attempt {attempt + 1}")
+                dprint(f"Start/Goal placed successfully at attempt {attempt + 1}")
                 return
             else:
                 clearance_failures += 1

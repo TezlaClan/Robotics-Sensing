@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# Generated recordings (mp4s + their .json setup files)
+*.mp4
+videos/

@@ -13,6 +13,8 @@ import heapq
 import math
 from typing import Tuple, List, Dict, Optional
 
+from utils.debug import dprint
+
 GridPosition = Tuple[int, int]
 
 
@@ -35,10 +37,10 @@ class AStarPlanner:
         """
 
         if start == goal:
-            print(f"[A*] Start == Goal: {start}")
+            dprint(f"[A*] Start == Goal: {start}")
             return []
 
-        print(f"[A*] Planning from {start} to {goal}")
+        dprint(f"[A*] Planning from {start} to {goal}")
 
         open_set = []
         heapq.heappush(open_set, (0, start))
@@ -57,7 +59,7 @@ class AStarPlanner:
 
             if current == goal:
                 path = self._reconstruct_path(came_from, current)
-                print(f"[A*] Path found in {iterations} iterations: {len(path)} cells")
+                dprint(f"[A*] Path found in {iterations} iterations: {len(path)} cells")
                 return path
 
             for neighbour in self._get_neighbours(current, internal_map):
@@ -72,7 +74,7 @@ class AStarPlanner:
                   heapq.heappush(open_set, (f, neighbour))
 
         # No path found
-        print(f"[A*] No path found after {iterations} iterations")
+        dprint(f"[A*] No path found after {iterations} iterations")
         return []
 
     # =========================
@@ -118,14 +120,14 @@ class AStarPlanner:
                   neighbours.append((nx, ny))
 
       if not neighbours:
-          print(f"[A*] WARNING: No neighbours for node {node}!")
-          print(f"[A*] Map prob at node: {internal_map[y][x]}")
+          dprint(f"[A*] WARNING: No neighbours for node {node}!")
+          dprint(f"[A*] Map prob at node: {internal_map[y][x]}")
           for dx, dy in directions:
               nx, ny = x + dx, y + dy
               if 0 <= nx < width and 0 <= ny < height:
                   blocked = self._is_blocked(nx, ny, internal_map, inflation_radius)
                   prob = internal_map[ny][nx]
-                  print(f"[A*]   ({nx}, {ny}): prob={prob:.2f}, blocked={blocked}")
+                  dprint(f"[A*]   ({nx}, {ny}): prob={prob:.2f}, blocked={blocked}")
       
       return neighbours
 

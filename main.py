@@ -6,6 +6,7 @@ Entry point for running the simulation.
 
 from config import CONFIG
 
+from utils.debug import set_debug, dprint
 from utils.random_manager import RandomManager
 
 from core.environment import Environment
@@ -28,7 +29,7 @@ def create_map(config, rng_manager):
     height = config["map_height"]
 
     map_type = config["map_type"]
-    print(f"   Generating {map_type} map ({width}x{height})...")
+    dprint(f"   Generating {map_type} map ({width}x{height})...")
 
     if map_type == "maze":
         generator = MazeGenerator(width, height, rng_manager)
@@ -46,42 +47,50 @@ def create_map(config, rng_manager):
 
 
 def main():
+    # Apply verbosity setting before anything prints.
+    set_debug(CONFIG.get("debug", False))
+
     # =========================
     # RNG Setup
     # =========================
-    print("1. Initializing RNG Manager...")
+    dprint("1. Initializing RNG Manager...")
     rng_manager = RandomManager(
         map_seed=CONFIG["map_seed"],
         behaviour_seed=CONFIG["behaviour_seed"],
     )
 
-    print("SEEDS:", rng_manager.get_seeds())
+    # Record the resolved seeds back into the config so they appear in logs
+    # and the recording's setup file (they may have been None / auto-generated).
+    seeds = rng_manager.get_seeds()
+    CONFIG["map_seed"] = seeds["map_seed"]
+    CONFIG["behaviour_seed"] = seeds["behaviour_seed"]
+    dprint("SEEDS:", seeds)
 
     # =========================
     # Map
     # =========================
-    print("2. Creating map...")
+    dprint("2. Creating map...")
     map_obj = create_map(CONFIG, rng_manager)
-    print("Map created successfully")
+    dprint("Map created successfully")
 
-    print("\nGenerated Map:\n")
-    print(map_obj)
+    dprint("\nGenerated Map:\n")
+    dprint(map_obj)
 
     # =========================
     # Environment
     # =========================
-    print("3. Creating environment...")
+    dprint("3. Creating environment...")
     environment = Environment(map_obj)
-    print("Environment created")
+    dprint("Environment created")
 
     # =========================
     # Agent
     # =========================
-    print("4. Creating agent...")
-    start_pos = (map_obj.start[0], map_obj.start[1])
-    print(f"   Map start (grid): {map_obj.start}")
-    print(f"   Start position (centered): {start_pos}")
-    print(f"   Map goal (grid): {map_obj.goal}")
+    dprint("4. Creating agent...")
+    start_pos = (map_obj.start[0] + 0.5, map_obj.start[1] + 0.5)
+    dprint(f"   Map start (grid): {map_obj.start}")
+    dprint(f"   Start position (centered): {start_pos}")
+    dprint(f"   Map goal (grid): {map_obj.goal}")
 
     agent = create_agent(
         agent_id=0,
@@ -91,17 +100,17 @@ def main():
         rng_manager=rng_manager,
         config=CONFIG
     )
-    print("Agent created")
+    dprint("Agent created")
 
     agents = [agent]
 
     # =========================
     # Simulation
     # =========================
-    print("5. Starting simulation...")
+    dprint("5. Starting simulation...")
     sim = Simulation(environment, agents, CONFIG)
     sim.run()
-    print("Simulation completed")
+    dprint("Simulation completed")
 
 
 if __name__ == "__main__":
