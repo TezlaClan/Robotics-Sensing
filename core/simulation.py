@@ -37,11 +37,6 @@ class Simulation:
 
         while not self._should_terminate():
             self._step()
-            
-            # Safety limit - stop after 500 steps
-            if self.current_step >= 500:
-                print("Reached 500 step safety limit, stopping")
-                break
 
         print("\nSimulation finished.")
         print(f"Total steps: {self.current_step}")

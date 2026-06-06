@@ -39,8 +39,6 @@ class Renderer:
                 else:
                     img[y][x] = [1.0, 1.0, 1.0]
 
-        self.ax.imshow(img, cmap="gray_r", interpolation="nearest")
-
         # =========================
         # 2. Fog-of-War Overlay
         # =========================
@@ -65,6 +63,9 @@ class Renderer:
                         img[y][x] = img[y][x] * 0.7 + np.array([0.6, 0.2, 0.2]) * 0.3
                     elif prob < 0.4:
                       img[y][x] = img[y][x] * 0.7 + np.array([0.2, 0.8, 0.2]) * 0.3
+
+        # Draw the fully composited image (base map + fog) in one pass
+        self.ax.imshow(img, cmap="gray_r", interpolation="nearest")
 
         # =========================
         # 2. Draw Start/Goal (under everything)
