@@ -58,6 +58,7 @@ class SLAMLocalization:
         alpha_slow: float = 0.01,
         alpha_fast: float = 0.2,
         anchor_sigma: float = 1.0,
+        jump_margin: float = 2.0,
         rng_manager=None,
     ):
         """
@@ -102,6 +103,18 @@ class SLAMLocalization:
         self._wallmask: Optional[np.ndarray] = None  # cached boolean wall mask
         self._df_version = None
 
+        # Spurious-jump gating. The robot's pose can move at most ~|motion| per
+        # step, so an estimate that leaps much further is a perceptual-aliasing
+        # teleport, not real motion. jump_margin is the slack (cells) allowed
+        # beyond |motion| for legitimate sub-cell correction before a jump is
+        # rejected. Tracks the last accepted estimate and a run-length of
+        # consecutive rejections (a genuine relocalization is accepted once it
+        # persists, so the gate can't lock the filter out forever).
+        self.jump_margin = jump_margin
+        self.max_gated_steps = 40
+        self._last_est: Optional[Position] = None
+        self._gate_count = 0
+
     # =========================
     # Main API
     # =========================
@@ -130,11 +143,61 @@ class SLAMLocalization:
             self._weight(scan, internal_map, anchors, map_version)
             self._resample_if_needed(internal_map)
 
-        # 4. Report the weighted-mean pose, kept out of known walls.
+        # 4. Report the mode pose, kept out of known walls, then reject spurious
+        #    teleports (the map is correct - only the estimate jumped).
         est = self._estimate()
         if internal_map is not None:
             est = self._project_out_of_walls(est, internal_map)
+            est = self._gate_jump(est, motion, internal_map)
+        self._last_est = est
         return est
+
+    # =========================
+    # Spurious-jump gating
+    # =========================
+
+    def _gate_jump(self, est, motion, internal_map):
+        """
+        Reject perceptual-aliasing teleports. Real motion moves the pose at most
+        ~|motion| per step, so an estimate that jumps much further is the filter
+        committing to a look-alike location, not the robot moving. When that
+        happens we distrust the scan-based estimate for this step, fall back to
+        the motion-predicted pose (dead reckoning from the last good estimate),
+        and re-seed the particle cloud there so it re-locks against the (correct,
+        untouched) map - no map rebuild, no lost exploration.
+
+        A run of rejections is capped (max_gated_steps): if the filter keeps
+        insisting on the far location it is eventually accepted, so a genuine
+        relocalization is not blocked forever.
+        """
+        if self._last_est is None:
+            return est
+
+        predicted = (self._last_est[0] + motion[0], self._last_est[1] + motion[1])
+        jump = math.hypot(est[0] - predicted[0], est[1] - predicted[1])
+        allowed = math.hypot(motion[0], motion[1]) + self.jump_margin
+
+        if jump > allowed and self._gate_count < self.max_gated_steps:
+            self._gate_count += 1
+            self._reseed(predicted)
+            return self._project_out_of_walls(predicted, internal_map)
+
+        self._gate_count = 0
+        return est
+
+    def _reseed(self, center: Position):
+        """Collapse the cloud back to a tight blob around `center` and stop the
+        divergence-injection that caused the jump, so the filter re-converges
+        from continuity instead of from the spurious alias."""
+        cx, cy = center
+        sigma = max(self.init_sigma, 0.75)
+        self.particles = [
+            [self.rng.gauss(cx, sigma), self.rng.gauss(cy, sigma)]
+            for _ in range(self.num_particles)
+        ]
+        self.weights = [1.0 / self.num_particles] * self.num_particles
+        self.w_fast = self.w_slow          # cancel the augmented-MCL injection
+        self.injection_ratio = 0.0
 
     # =========================
     # 1. Initialisation

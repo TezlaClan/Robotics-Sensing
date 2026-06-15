@@ -96,6 +96,11 @@ CONFIG = {
     "slam_num_particles": 200,   # particle cloud size
     "slam_measurement_sigma": 1.2,  # likelihood-field std-dev in cells (larger = more forgiving)
     "slam_z_rand": 0.1,          # uniform-noise floor for outlier robustness (0..1)
+    # Spurious-jump gating: an estimate that leaps more than |motion| + this many
+    # cells in one step is treated as a perceptual-aliasing teleport, rejected,
+    # and the cloud re-seeded at the motion-predicted pose (the map is left
+    # intact). Larger = more tolerant of big single-step corrections.
+    "slam_jump_margin": 2.0,
     # Speed/accuracy knob: scan endpoints scored per particle per step. Lower is
     # faster with graceful accuracy loss (see also slam_num_particles above and
     # sensor_num_beams in the Sensor section).
