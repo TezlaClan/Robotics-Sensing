@@ -120,6 +120,7 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         communication_range=config.get("communication_range", 10.0),
         swarm_slam=config.get("swarm_slam", False),
         sensor_range_sigma=config.get("sensor_range_sigma", 0.0),
+        map_anchor=config.get("map_anchor", "world"),
     )
 
     # In "shared" map mode all agents reference the one grid held by the

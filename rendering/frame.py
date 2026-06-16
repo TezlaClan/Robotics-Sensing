@@ -25,6 +25,7 @@ DEFAULT_LAYERS = {
     "particles": True,
     "agents": True,
     "links": True,
+    "drift": True,
 }
 
 
@@ -87,6 +88,26 @@ def draw_frame(ax, environment, agents, layers=None, comm_range=None):
     # =========================
     if layers.get("map", True):
         ax.imshow(img, cmap="gray_r", interpolation="nearest", extent=[0, w, h, 0])
+
+    # =========================
+    # 3b. Map-drift overlay
+    # =========================
+    # Highlights where an agent's CONFIDENT belief disagrees with ground truth -
+    # i.e. the map warp produced by "local" (robot-anchored) mapping. With
+    # "world" anchoring this is essentially empty (the map tracks truth).
+    #   magenta = believes WALL where space is truly free (a displaced wall)
+    #   cyan    = believes FREE where there is truly a wall (the wall's true cell,
+    #             vacated because the wall was placed elsewhere)
+    # The magenta/cyan separation makes the drift offset directly visible.
+    if layers.get("drift", True) and agents:
+        true_wall = np.array(grid) == 1
+        overlay = np.zeros((h, w, 4))
+        for agent in agents:
+            im = np.asarray(agent.internal_map)
+            overlay[(im > 0.6) & (~true_wall)] = [1.0, 0.0, 1.0, 0.75]  # phantom wall
+            overlay[(im < 0.4) & true_wall] = [0.0, 1.0, 1.0, 0.55]     # vacated wall
+        if overlay[..., 3].any():
+            ax.imshow(overlay, interpolation="nearest", extent=[0, w, h, 0], zorder=2.4)
 
     # =========================
     # 4. Start / Goal markers

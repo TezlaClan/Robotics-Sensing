@@ -52,6 +52,7 @@ CONFIG = {
         "particles": True,   # SLAM particle cloud (orange), if using slam
         "agents": True,      # true (red) and believed (blue) agent positions
         "links": True,       # faint lines between in-range (communicating) agents
+        "drift": True,       # map-drift overlay: magenta=displaced wall, cyan=vacated wall
     },
 
     # =========================
@@ -62,6 +63,16 @@ CONFIG = {
     #   "shared"     -> all agents read/write ONE global occupancy grid
     #   "individual" -> each agent keeps its own grid, merged only when in range
     "map_sharing": "individual",
+
+    # How each agent's occupancy grid is anchored:
+    #   "world" -> integrate observations at their true world cells; the map is
+    #              globally aligned to ground truth (clean benchmark; default).
+    #   "local" -> integrate at the robot's BELIEVED pose (real SLAM-style): the
+    #              map rides the estimated trajectory and drifts/warps with the
+    #              localization error (no loop closure pulls it back). Intended for
+    #              "individual" maps - it is not meaningful with a single shared
+    #              grid, since agents have different believed frames.
+    "map_anchor": "local",
 
     # Communication (only meaningful when map_sharing == "individual")
     "comm_mode": "local",        # "global" (always) or "local" (within range only)

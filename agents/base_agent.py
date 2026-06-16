@@ -52,6 +52,7 @@ class BaseAgent:
         communication_range: float = 10.0,
         swarm_slam: bool = False,
         sensor_range_sigma: float = 0.0,
+        map_anchor: str = "world",
     ):
         self.id = agent_id
 
@@ -70,6 +71,9 @@ class BaseAgent:
         self.swarm_slam = swarm_slam
         # Noise std-dev applied to a synthesised inter-agent relative measurement.
         self.sensor_range_sigma = sensor_range_sigma
+        # "world" (map anchored to ground truth) or "local" (anchored to the
+        # robot's believed pose, i.e. real SLAM-style drifting map).
+        self.map_anchor = map_anchor
 
         # Occupancy-grid update: small steps so a single noisy reading barely
         # moves a cell; a cell locks (stops updating) once it saturates past the
@@ -163,13 +167,27 @@ class BaseAgent:
         Main per-timestep update.
         """
 
-        # 1. Sense environment (observations are absolute world cells)
+        # 1. Sense environment. The sensor sits on the TRUE robot, so it returns
+        # the absolute world cells it actually sees.
         observations = self.sensor_model.sense(
             environment,
             self.true_position
         )
 
-        # 2. Update internal map (uses absolute cells -> map stays world-aligned)
+        # 2. Update internal map.
+        #   "world": integrate at those true world cells -> the map is globally
+        #            anchored to ground truth (clean benchmark; default).
+        #   "local": re-anchor each observation to the robot's BELIEVED cell, i.e.
+        #            keep the sensor-relative offset (cell - true_cell) but add the
+        #            believed cell instead. The map then rides the estimated
+        #            trajectory like real SLAM: identical to "world" while the
+        #            estimate is accurate, and warps by the localization error as
+        #            it drifts (there is no loop closure to pull it back).
+        if self.map_anchor == "local":
+            sx = int(self.believed_position[0]) - int(self.true_position[0])
+            sy = int(self.believed_position[1]) - int(self.true_position[1])
+            if sx or sy:
+                observations = [(x + sx, y + sy, occ) for (x, y, occ) in observations]
         self._update_internal_map(observations)
 
         # 3. Update localization.
