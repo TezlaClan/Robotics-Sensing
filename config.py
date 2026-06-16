@@ -88,7 +88,7 @@ CONFIG = {
     # =========================
     # Sensor
     # =========================
-    "sensor_range": 3,
+    "sensor_range": 8,
     "sensor_mode": "radius",  # "radius" or "los"
     "sensor_false_positive": 0.1,   # free cell reported as an obstacle
     "sensor_false_negative": 0.1,   # obstacle reported as free
@@ -112,6 +112,13 @@ CONFIG = {
     # and the cloud re-seeded at the motion-predicted pose (the map is left
     # intact). Larger = more tolerant of big single-step corrections.
     "slam_jump_margin": 2.0,
+    # Local map mode only (EXPERIMENTAL, default off): extra likelihood weight for
+    # scan hits landing on TRUSTED (locked) walls, as an explicit global drift
+    # anchor. In practice the filter already localizes against locked walls (they
+    # are part of the >wall-threshold set), so at sensor_range 8 this re-weighting
+    # does not beat the baseline - small values (~0.2) cut worst-case drift but
+    # raise average error; larger values degrade it. Kept as an opt-in lever.
+    "slam_trusted_weight": 0.0,
     # Speed/accuracy knob: scan endpoints scored per particle per step. Lower is
     # faster with graceful accuracy loss (see also slam_num_particles above and
     # sensor_num_beams in the Sensor section).

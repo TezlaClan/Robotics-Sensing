@@ -41,11 +41,13 @@ class OdometryLocalization:
         internal_map=None,
         anchors=None,
         map_version=None,
+        locked=None,
+        anchor_mode="world",
     ) -> Position:
         """
         Update believed position using odometry + noise.
 
-        `anchors` (inter-agent pose hints) and `map_version` are accepted for a
+        `anchors`, `map_version`, `locked`, `anchor_mode` are accepted for a
         uniform localizer interface but ignored - dead reckoning has no
         correction step.
         """

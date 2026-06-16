@@ -174,15 +174,14 @@ class BaseAgent:
             self.true_position
         )
 
-        # 2. Update internal map.
+        # Update internal map.
         #   "world": integrate at those true world cells -> the map is globally
         #            anchored to ground truth (clean benchmark; default).
         #   "local": re-anchor each observation to the robot's BELIEVED cell, i.e.
         #            keep the sensor-relative offset (cell - true_cell) but add the
         #            believed cell instead. The map then rides the estimated
-        #            trajectory like real SLAM: identical to "world" while the
-        #            estimate is accurate, and warps by the localization error as
-        #            it drifts (there is no loop closure to pull it back).
+        #            trajectory like real SLAM and warps with the localization
+        #            error (no loop closure to pull it back).
         if self.map_anchor == "local":
             sx = int(self.believed_position[0]) - int(self.true_position[0])
             sy = int(self.believed_position[1]) - int(self.true_position[1])
@@ -190,11 +189,10 @@ class BaseAgent:
                 observations = [(x + sx, y + sy, occ) for (x, y, occ) in observations]
         self._update_internal_map(observations)
 
-        # 3. Update localization.
-        # A real range sensor reports hits relative to itself as continuous
-        # ranges. Casting from the true *floating-point* position means the scan
-        # depends on the sub-tile position, so the filter can localize WITHIN a
-        # tile rather than only to tile resolution.
+        # Update localization. A real range sensor reports hits relative to itself
+        # as continuous ranges. Casting from the true *floating-point* position
+        # means the scan depends on the sub-tile position, so the filter can
+        # localize WITHIN a tile rather than only to tile resolution.
         scan = self.sensor_model.range_scan(environment, self.true_position)
 
         # Swarm SLAM: a confident in-range neighbour anchors our pose estimate.
@@ -207,6 +205,8 @@ class BaseAgent:
             self.internal_map,
             anchors=anchors,
             map_version=self._wallver[0],
+            locked=self.locked,
+            anchor_mode=self.map_anchor,
         )
 
         # 4. Planning
@@ -311,12 +311,17 @@ class BaseAgent:
             else:
                 after = max(0.0, before - step)
             self.internal_map[y][x] = after
-            # Only a crossing of the wall threshold affects the SLAM update.
+            # World mode localizes against every >WALL_THR cell, so only a wall
+            # threshold crossing changes its mask.
             if (before > WALL_THR) != (after > WALL_THR):
                 mask_changed = True
 
             if after >= self.map_lock_high or after <= self.map_lock_low:
                 self.locked[y][x] = True
+                # Local mode localizes against TRUSTED (locked) walls only, so a
+                # cell locking as a wall also changes the mask the filter sees.
+                if self.map_anchor == "local" and after >= self.map_lock_high:
+                    mask_changed = True
 
         if mask_changed:
             self._wallver[0] += 1

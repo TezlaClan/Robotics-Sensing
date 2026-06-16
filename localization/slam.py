@@ -59,6 +59,7 @@ class SLAMLocalization:
         alpha_fast: float = 0.2,
         anchor_sigma: float = 1.0,
         jump_margin: float = 2.0,
+        trusted_weight: float = 0.0,
         rng_manager=None,
     ):
         """
@@ -82,6 +83,11 @@ class SLAMLocalization:
         # Spread (cells) of an inter-agent relative measurement, used when a
         # confident neighbour anchors this filter (swarm SLAM).
         self.anchor_sigma = anchor_sigma
+        # Extra likelihood weight for hits landing on TRUSTED (locked) walls, used
+        # only in local map mode as a global drift anchor (0 = off). Trusted walls
+        # don't co-drift with the belief, so this penalises a globally-shifted pose
+        # without discarding the fresh-wall tracking that keeps the cloud tight.
+        self.trusted_weight = trusted_weight
 
         # Augmented-MCL recovery: track slow/fast averages of measurement fit and
         # inject random hypotheses when the fit collapses (filter divergence /
@@ -101,6 +107,7 @@ class SLAMLocalization:
         # was built from, so it is recomputed only when the map actually changes.
         self._dist_field: Optional[np.ndarray] = None
         self._wallmask: Optional[np.ndarray] = None  # cached boolean wall mask
+        self._dist_field_locked: Optional[np.ndarray] = None  # trusted-walls field
         self._df_version = None
 
         # Spurious-jump gating. The robot's pose can move at most ~|motion| per
@@ -127,6 +134,8 @@ class SLAMLocalization:
         internal_map: Optional[List[List[float]]] = None,
         anchors: Optional[List[Tuple[Position, float]]] = None,
         map_version=None,
+        locked=None,
+        anchor_mode: str = "world",
     ) -> Position:
         # 1. Lazy init around the (known) start pose.
         if self.particles is None:
@@ -139,8 +148,10 @@ class SLAMLocalization:
         #    `anchors` are implied-pose hints from confident neighbours (swarm
         #    SLAM); they add evidence alongside the agent's own scan.
         #    `map_version` lets the distance field be cached across steps.
+        #    `anchor_mode="local"` + `locked`: correct only against TRUSTED
+        #    (locked) walls so a robot-anchored map can't reinforce its own drift.
         if internal_map is not None:
-            self._weight(scan, internal_map, anchors, map_version)
+            self._weight(scan, internal_map, anchors, map_version, locked, anchor_mode)
             self._resample_if_needed(internal_map)
 
         # 4. Report the mode pose, kept out of known walls, then reject spurious
@@ -242,7 +253,8 @@ class SLAMLocalization:
     # numerically identical to full convergence where it matters.
     _DF_CAP = 12
 
-    def _weight(self, scan: List[RelObservation], internal_map, anchors=None, map_version=None):
+    def _weight(self, scan: List[RelObservation], internal_map, anchors=None,
+                map_version=None, locked=None, anchor_mode="world"):
         """
         Vectorised likelihood-field measurement update (numpy).
 
@@ -251,22 +263,37 @@ class SLAMLocalization:
         where they fall on walls, an in-wall penalty, swarm anchors, log-sum-exp
         normalisation, and the Augmented-MCL fit tracking - but evaluated over all
         particles and scan endpoints at once.
+
+        In local map mode, an *additive* trusted-anchor term (see trusted_weight)
+        also rewards hits landing on locked walls - confirmed, never-moved
+        geometry chained out from the known start. Those don't co-drift with the
+        belief, so they penalise a globally-shifted pose without removing the
+        fresh-wall tracking that keeps the cloud tight.
         """
         # The measurement update depends on the map ONLY through the binary wall
-        # mask (cell > _WALL_THRESHOLD): the distance field, the free-cell-on-wall
-        # test, and the in-wall penalty all use it. So cache the boolean mask and
-        # the distance field together, keyed by map_version (which the agent bumps
-        # only when a cell crosses the wall threshold). On the common step where
-        # values drift but no cell flips, this skips the array build AND the
-        # transform entirely. Behaviour is identical to recomputing every step.
+        # mask: the distance field, the free-cell-on-wall test, and the in-wall
+        # penalty all use it. Cache the mask + field together, keyed by
+        # map_version (bumped only when the mask changes - a wall-threshold
+        # crossing, or a wall locking in local mode). In local mode also cache a
+        # second field over the TRUSTED (locked) walls for the anchor term.
+        use_trusted = (anchor_mode == "local" and locked is not None
+                       and self.trusted_weight > 0)
         if (self._dist_field is None or map_version is None
                 or map_version != self._df_version):
             occ = np.asarray(internal_map, dtype=float) > _WALL_THRESHOLD  # (H, W)
             self._dist_field = self._distance_transform(occ)
             self._wallmask = occ
+            if use_trusted:
+                trusted = occ & np.asarray(locked, dtype=bool)
+                self._dist_field_locked = (
+                    self._distance_transform(trusted) if trusted.any() else None
+                )
+            else:
+                self._dist_field_locked = None
             self._df_version = map_version
         occ = self._wallmask
         df = self._dist_field
+        df_locked = self._dist_field_locked
         height, width = occ.shape
 
         anchor_two_sigma_sq = 2.0 * self.anchor_sigma * self.anchor_sigma
@@ -287,6 +314,7 @@ class SLAMLocalization:
         px, py = P[:, 0], P[:, 1]
 
         score = np.zeros(N)                                  # measurement fit only
+        trusted_term = None                                  # additive anchor (-> lw)
 
         # --- Obstacle hits vs the bilinearly-interpolated likelihood field. ---
         if hits:
@@ -296,6 +324,17 @@ class SLAMLocalization:
             prob = self._sample_prob(df, sx, sy, two_sigma_sq, width, height)
             logp = np.where(prob > 0, np.log(np.where(prob > 0, prob, 1.0)), log_floor)
             score += logp.sum(axis=1)
+
+            # Additive trusted-anchor term (local mode). Reward the same hits for
+            # also landing on TRUSTED walls. A globally-shifted particle's hits
+            # land `shift` away from the locked walls (which didn't co-drift), so
+            # this term penalises the shift - the global anchor - while the term
+            # above still tracks against all walls. Added to lw, not score, so it
+            # doesn't distort the augmented-MCL divergence fit.
+            if df_locked is not None:
+                probt = self._sample_prob(df_locked, sx, sy, two_sigma_sq, width, height)
+                logpt = np.where(probt > 0, np.log(np.where(probt > 0, probt, 1.0)), log_floor)
+                trusted_term = self.trusted_weight * logpt.sum(axis=1)
 
         # --- Free readings that fall inside a known wall are contradictions. ---
         if frees:
@@ -316,6 +355,10 @@ class SLAMLocalization:
         inb = (ipx >= 0) & (ipx < width) & (ipy >= 0) & (ipy < height)
         in_wall = (~inb) | occ[np.clip(ipy, 0, height - 1), np.clip(ipx, 0, width - 1)]
         lw += in_wall * log_wall_penalty
+
+        # Trusted-wall global anchor (local map mode), resampling weight only.
+        if trusted_term is not None:
+            lw += trusted_term
 
         # Inter-agent anchors (added to the resampling weight only, NOT the fit,
         # so they don't mask our own divergence). When our own scan is

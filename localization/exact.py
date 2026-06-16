@@ -27,6 +27,8 @@ class ExactLocalization:
         internal_map=None,
         anchors=None,
         map_version=None,
+        locked=None,
+        anchor_mode="world",
     ) -> Position:
         return (
             believed_position[0] + motion[0],

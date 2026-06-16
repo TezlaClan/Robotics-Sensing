@@ -34,6 +34,7 @@ def _create_localization(config, rng_manager):
             anchor_sigma=config.get("slam_anchor_sigma", 1.0),
             max_endpoints=config.get("slam_max_endpoints", 24),
             jump_margin=config.get("slam_jump_margin", 2.0),
+            trusted_weight=config.get("slam_trusted_weight", 0.0),
             rng_manager=rng_manager,
         )
     elif kind == "exact":
