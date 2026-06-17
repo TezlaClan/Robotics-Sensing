@@ -27,7 +27,19 @@ PYTHONPATH=. MPLBACKEND=Agg .venv/bin/python tools/sweep.py \
 
 Flags: `--maps`, `--seeds` (`a-b` or `a,b,c`; default = curated set),
 `--overrides` (JSON config patch), `--agents`, `--map-size`, `--max-steps`,
-`-j/--jobs` (default = all cores), `--per-run`, `--select N`, `--track-paths DIR`.
+`-j/--jobs` (default = all cores), `--per-run`, `--select N`, `--track-paths DIR`,
+`--random N` / `--random-seed S`.
+
+### Generalization batch (overfit check)
+
+`--random N` (default **10**) runs, *in addition to* the curated set and reported
+as a separate section, **N fresh random seeds per map** drawn from a range disjoint
+from every curated/historical seed. The picker is entropy-seeded, so it sees
+**different maps every run** — this is a deliberate anti-overfit check, *not* a
+precise benchmark (its numbers vary run to run). If the curated set looks great but
+this batch is much worse, the solution is overfit to the curated seeds. The seeds
+it used are printed so a surprising result can be reproduced (or pass
+`--random-seed S`). Use `--random 0` to skip it for a fast curated-only A/B.
 
 Reported metrics: completion (overall + per map), localization error mean/max,
 map-warp (decided cells disagreeing with ground truth, per agent), avg steps,
@@ -232,3 +244,16 @@ Two proposed upgrades, A/B'd on the all-on hard set (baseline 14/30):
   is the local-mode frame mismatch — index-merging disagreements are mostly
   legitimate frame differences. It does cut worst-case drift (max 21→12), so it is
   kept as an opt-in lever. Real fix needs map registration / loop closure.
+
+### 2026-06-17 — Occlusion gating + generalization batch
+
+- **Occlusion gating (`occlusion_block`, shipped ON)** — the biggest single win.
+  Drop any observation whose ray from the believed pose crosses a *locked* wall, so
+  drift can't write through confirmed walls in local mode (SLAM_REPORT §22). On the
+  hard set: **17→27/30**, loc mean 1.04→0.36, **max 21.1→2.47**, warp 21→3.2, and
+  *faster* (runs finish: 90k vs 216k agent-steps). World mode neutral (30/30, 0.248).
+  Remaining hard-set failures: room1089, room1071, cave1137.
+- **Generalization batch added** (`--random`, default 10/map). With the full
+  default config: curated **27/30** vs random **26/30** (loc 0.42, max 8.46) — the
+  random, never-tuned maps perform on par with the curated set, so the cumulative
+  gains generalize rather than overfitting the curated seeds.

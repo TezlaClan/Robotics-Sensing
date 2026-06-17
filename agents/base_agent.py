@@ -61,6 +61,7 @@ class BaseAgent:
         search_block_frac: float = 0.5,
         search_linger: int = 6,
         erosion_protect_steps: int = 30,
+        occlusion_block: bool = True,
     ):
         self.id = agent_id
 
@@ -218,6 +219,14 @@ class BaseAgent:
         self.erosion_protect_steps = erosion_protect_steps
         self._eroded_cooldown: dict = {}
 
+        # Occlusion gating: a confirmed (locked) wall blocks sensing past it. The
+        # cell FOV is already shadowcast against the true map, but in "local" mode
+        # observations are re-anchored to the believed pose, so a drift offset can
+        # land a genuine reading *behind* a believed locked wall and corrupt it.
+        # When on, an observation whose ray from the believed pose crosses a locked
+        # wall is dropped (not allowed to change the map).
+        self.occlusion_block = occlusion_block
+
         # Diagnostic counters ("how often did the agent decide the map was wrong").
         # Read by the sweep harness; see tools/sweep.py.
         self.n_recoveries = 0      # hard recoveries (unlock-all + reopen + step)
@@ -261,6 +270,8 @@ class BaseAgent:
             sy = int(self.believed_position[1]) - int(self.true_position[1])
             if sx or sy:
                 observations = [(x + sx, y + sy, occ) for (x, y, occ) in observations]
+        if self.occlusion_block:
+            observations = self._filter_occluded(observations)
         self._update_internal_map(observations)
 
         # Update localization. A real range sensor reports hits relative to itself
@@ -368,6 +379,48 @@ class BaseAgent:
     # =========================
     # Internal Map Update
     # =========================
+
+    def _filter_occluded(self, observations):
+        """
+        Drop observations whose ray from the believed pose crosses a confirmed
+        (locked) wall - that geometry can't be seen, so it must not change the map.
+        Only locked walls occlude (a still-accumulating wall is not trusted enough
+        to hide things behind it). The target cell itself is never the occluder, so
+        the wall being looked at is still mapped; only cells BEYOND it are blocked.
+        """
+        ox = int(self.believed_position[0])
+        oy = int(self.believed_position[1])
+        kept = []
+        for obs in observations:
+            x, y, _ = obs
+            if not self._occluded_by_locked(ox, oy, x, y):
+                kept.append(obs)
+        return kept
+
+    def _occluded_by_locked(self, ox, oy, x, y) -> bool:
+        """True if a locked wall lies strictly between (ox,oy) and (x,y).
+        Bresenham line; the endpoints are not treated as occluders."""
+        if ox == x and oy == y:
+            return False
+        dx = abs(x - ox)
+        dy = abs(y - oy)
+        sx = 1 if x > ox else -1
+        sy = 1 if y > oy else -1
+        err = dx - dy
+        cx, cy = ox, oy
+        while True:
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                cx += sx
+            if e2 < dx:
+                err += dx
+                cy += sy
+            if cx == x and cy == y:
+                return False  # reached the target without crossing a locked wall
+            if (0 <= cx < self.map_width and 0 <= cy < self.map_height
+                    and self.locked[cy][cx] and self.internal_map[cy][cx] > WALL_THR):
+                return True
 
     def _update_internal_map(self, observations):
         """

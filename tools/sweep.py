@@ -29,6 +29,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from multiprocessing import Pool
@@ -237,6 +238,70 @@ def difficulty(r):
     return r["steps"] + r["err_mean"] * 200 + r["err_max"] * 20
 
 
+def run_batch(tasks, jobs):
+    """Run a list of task dicts, in parallel if jobs > 1. Returns (results, wall)."""
+    t0 = time.perf_counter()
+    if jobs and jobs > 1:
+        with Pool(jobs) as pool:
+            results = pool.map(run_one, tasks)
+    else:
+        results = [run_one(t) for t in tasks]
+    return results, time.perf_counter() - t0
+
+
+def summarize(results, maps, label, wall, jobs, per_run=False, track_dir=None):
+    """Print the aggregate report block for a batch of results."""
+    n = len(results)
+    completed = sum(1 for r in results if r["completed"])
+    err_mean = sum(r["err_mean"] for r in results) / n
+    err_max = max(r["err_max"] for r in results)
+    warp = sum(r["warp"] for r in results) / n
+    steps = sum(r["steps"] for r in results) / n
+    cpu = sum(r["elapsed"] for r in results)
+    asteps = sum(r["agent_steps"] for r in results)
+    ms_step = cpu / max(1, asteps) * 1000.0
+
+    per_map = {m: [0, 0] for m in maps}
+    fails = []
+    for r in results:
+        per_map.setdefault(r["map_type"], [0, 0])[1] += 1
+        if r["completed"]:
+            per_map[r["map_type"]][0] += 1
+        else:
+            fails.append(f"{r['map_type']}{r['seed']}")
+
+    if per_run:
+        for r in sorted(results, key=lambda r: (r["map_type"], r["seed"])):
+            print(f"{r['map_type']}{r['seed']:<6} "
+                  f"{'DONE' if r['completed'] else 'FAIL'} "
+                  f"steps={r['steps']:4d} err={r['err_mean']:.2f}/{r['err_max']:.2f} "
+                  f"warp={r['warp']:4.1f} "
+                  f"rec={r['recoveries']} srch={r['searches']} "
+                  f"ero={r['erosions']} reop={r['reopens']} gate={r['gates']} "
+                  f"{r['elapsed']*1000:.0f}ms")
+
+    print(f"--- {label} ---")
+    print(f"completion: {completed}/{n}")
+    for m in maps:
+        print(f"  {m}: {per_map[m][0]}/{per_map[m][1]}")
+    print(f"loc err mean: {err_mean:.3f}")
+    print(f"loc err max:  {err_max:.3f}")
+    print(f"map warp mean: {warp:.2f}")
+    print(f"avg steps: {steps:.1f}")
+    print(f"compute: {ms_step:.3f} ms/agent-step  "
+          f"({cpu:.1f}s CPU over {asteps} agent-steps)")
+    print(f"wall time: {wall:.1f}s  (-j {jobs})")
+    print(f"events: recoveries={sum(r['recoveries'] for r in results)} "
+          f"searches={sum(r['searches'] for r in results)} "
+          f"erosions={sum(r['erosions'] for r in results)} "
+          f"reopens={sum(r['reopens'] for r in results)} "
+          f"jump-gates={sum(r['gates'] for r in results)}")
+    if track_dir:
+        print(f"paths written to: {track_dir}/")
+    if fails:
+        print(f"failed: {fails}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Parallel empirical sweep.")
     ap.add_argument("--maps", default="room,bsp,cave",
@@ -262,6 +327,13 @@ def main():
     ap.add_argument("--select", type=int, default=0, metavar="N",
                     help="seed-selection mode: print the N hardest seeds per map "
                          "(by difficulty score) instead of an aggregate")
+    ap.add_argument("--random", type=int, default=10, metavar="N",
+                    help="also run N RANDOM (fresh, never-curated) seeds per map as "
+                         "a separate generalization batch - an overfit check, not a "
+                         "precise benchmark (seeds differ each run). 0 disables.")
+    ap.add_argument("--random-seed", type=int, default=None,
+                    help="seed the random-batch seed picker for a reproducible "
+                         "generalization batch (default: fresh entropy each run)")
     args = ap.parse_args()
 
     overrides = json.loads(args.overrides)
@@ -287,13 +359,7 @@ def main():
                 "track_paths": args.track_paths,
             })
 
-    t0 = time.perf_counter()
-    if args.jobs and args.jobs > 1:
-        with Pool(args.jobs) as pool:
-            results = pool.map(run_one, tasks)
-    else:
-        results = [run_one(t) for t in tasks]
-    wall = time.perf_counter() - t0
+    results, wall = run_batch(tasks, args.jobs)
 
     # ---- selection mode ----
     if args.select:
@@ -313,59 +379,36 @@ def main():
                       f"diff={difficulty(r):.0f}")
         return
 
-    # ---- aggregate report ----
-    n = len(results)
-    completed = sum(1 for r in results if r["completed"])
-    err_mean = sum(r["err_mean"] for r in results) / n
-    err_max = max(r["err_max"] for r in results)
-    warp = sum(r["warp"] for r in results) / n
-    steps = sum(r["steps"] for r in results) / n
-    cpu = sum(r["elapsed"] for r in results)
-    asteps = sum(r["agent_steps"] for r in results)
-    ms_step = cpu / max(1, asteps) * 1000.0
-
-    per_map = {m: [0, 0] for m in maps}
-    fails = []
-    for r in results:
-        per_map[r["map_type"]][1] += 1
-        if r["completed"]:
-            per_map[r["map_type"]][0] += 1
-        else:
-            fails.append(f"{r['map_type']}{r['seed']}")
-
-    if args.per_run:
-        for r in sorted(results, key=lambda r: (r["map_type"], r["seed"])):
-            print(f"{r['map_type']}{r['seed']:<6} "
-                  f"{'DONE' if r['completed'] else 'FAIL'} "
-                  f"steps={r['steps']:4d} err={r['err_mean']:.2f}/{r['err_max']:.2f} "
-                  f"warp={r['warp']:4.1f} "
-                  f"rec={r['recoveries']} srch={r['searches']} "
-                  f"ero={r['erosions']} reop={r['reopens']} gate={r['gates']} "
-                  f"{r['elapsed']*1000:.0f}ms")
-
+    # ---- standard / curated report ----
     print(f"overrides: {overrides}")
-    print(f"runs: {n}  (maps={maps}, "
-          f"{'STANDARD' if args.seeds is None else args.seeds} seeds)")
-    print(f"completion: {completed}/{n}")
-    for m in maps:
-        print(f"  {m}: {per_map[m][0]}/{per_map[m][1]}")
-    print(f"loc err mean: {err_mean:.3f}")
-    print(f"loc err max:  {err_max:.3f}")
-    print(f"map warp mean: {warp:.2f}")
-    print(f"avg steps: {steps:.1f}")
-    print(f"compute: {ms_step:.3f} ms/agent-step  "
-          f"({cpu:.1f}s CPU over {asteps} agent-steps)")
-    print(f"wall time: {wall:.1f}s  (-j {args.jobs})")
-    # Recovery/"irrational map" diagnostics (totals across all runs).
-    print(f"events: recoveries={sum(r['recoveries'] for r in results)} "
-          f"searches={sum(r['searches'] for r in results)} "
-          f"erosions={sum(r['erosions'] for r in results)} "
-          f"reopens={sum(r['reopens'] for r in results)} "
-          f"jump-gates={sum(r['gates'] for r in results)}")
-    if args.track_paths:
-        print(f"paths written to: {args.track_paths}/")
-    if fails:
-        print(f"failed: {fails}")
+    seeds_label = "STANDARD" if args.seeds is None else args.seeds
+    summarize(results, maps, f"{seeds_label} seeds ({len(results)} runs)",
+              wall, args.jobs, args.per_run, args.track_paths)
+
+    # ---- generalization batch (random, never-curated seeds) ----
+    # An overfit sanity check: fresh seeds each run, so it sees maps the solution
+    # was never tuned on. Not a precise benchmark (numbers vary run to run); a low
+    # completion here when the curated set looks good would flag overfitting.
+    if args.random > 0:
+        picker = random.Random(args.random_seed)  # entropy-seeded if None
+        rand_seeds = {
+            m: sorted(picker.sample(range(100_000, 1_000_000), args.random))
+            for m in maps
+        }
+        rtasks = []
+        for m in maps:
+            for s in rand_seeds[m]:
+                rtasks.append({
+                    "map_type": m, "map_seed": s, "behaviour_seed": s,
+                    "overrides": overrides, "map_size": args.map_size,
+                    "max_steps": args.max_steps, "track_paths": args.track_paths,
+                })
+        rresults, rwall = run_batch(rtasks, args.jobs)
+        print()
+        summarize(rresults, maps,
+                  f"GENERALIZATION: {args.random} RANDOM seeds/map (overfit check)",
+                  rwall, args.jobs)
+        print(f"random seeds used: {rand_seeds}")
 
 
 if __name__ == "__main__":

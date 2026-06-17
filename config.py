@@ -199,4 +199,13 @@ CONFIG = {
     # so reconsidering removes correct geometry more often than it clears a phantom.
     # Kept as an opt-in lever (it does cut worst-case drift: loc max 21->12).
     "merge_reconsider": False,
+
+    # Occlusion gating: a confirmed (locked) wall blocks sensing past it. The cell
+    # FOV is already shadowcast against the true map, but in "local" map mode an
+    # observation is re-anchored to the believed pose, so a drift offset can place
+    # a genuine reading BEHIND a believed locked wall and corrupt it. When on, any
+    # observation whose ray from the believed pose crosses a locked wall is dropped
+    # (not allowed to change the map). The wall being looked at is still mapped;
+    # only cells beyond it are blocked.
+    "occlusion_block": True,
 }

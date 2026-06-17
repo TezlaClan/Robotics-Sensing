@@ -667,6 +667,42 @@ one upside is lower worst-case drift (max 21→12 for the symmetric version). Ke
 an opt-in lever; not shipped. The proper fix for cross-frame merging is map
 registration / loop closure, still the outstanding back-end gap.
 
+## 22. Occlusion gating — don't sense through confirmed walls (biggest local-mode win)
+
+Symptom: in `local` mode, walls were occasionally written on *the far side* of a
+known wall. The cell FOV (`sensor_model.sense`) is recursive-shadowcast against the
+**true** map, so it never sees through a real wall — but `local` mode re-anchors
+every observation to the **believed** pose (`believed_cell - true_cell` shift).
+Under drift that offset slides a genuine reading *behind* a believed locked wall,
+so the integration corrupts a cell the agent has no line of sight to. Compounded
+over a run this is the dominant source of the catastrophic-drift failures.
+
+Fix (`base_agent._filter_occluded`, `occlusion_block`, default ON): before
+integrating, drop any observation whose Bresenham ray *from the believed pose*
+crosses a **locked** wall. Only locked (confirmed) walls occlude — a still-
+accumulating wall isn't trusted to hide things — and the target cell is never its
+own occluder, so the wall being looked at is still mapped; only cells beyond it are
+blocked.
+
+This is the **single largest improvement** of the whole effort, on the all-on hard
+set (30 runs, local mode):
+
+| occlusion_block | completion | loc mean | loc max | warp | steps |
+|---|---|---|---|---|---|
+| off | 17/30 | 1.038 | 21.11 | 20.96 | 2396 |
+| **on** | **27/30** | **0.364** | **2.47** | **3.16** | **992** |
+
++10 completions; worst-case drift **21.1 → 2.47 cells**; warp 21 → 3.2; and it is
+*faster overall* (runs finish instead of thrashing to max_steps: 90k agent-steps
+vs 216k). **World mode is neutral** (30/30, 0.248, warp 0.01) — there is no drift
+offset, so the believed-frame ray check essentially never fires. The Bresenham per
+observation adds ~0.2–0.5 ms/agent-step, far outweighed by the shorter runs.
+Remaining hard-set failures: room1089, room1071, cave1137.
+
+Generalization: a 30-run batch of **fresh random seeds** (the new overfit check,
+see `docs/TESTING.md`) scores **26/30** with this config — on par with the curated
+set, i.e. the gains are not overfit to the curated seeds.
+
 ## Updated tunables (`config.py`, additions)
 ```
 swarm_slam              True   inter-agent pose anchoring
@@ -685,6 +721,7 @@ search_linger           6      steps to dwell at a survey target so its wall can
 erosion_protect_steps   30     steps a freshly-eroded cell resists a peer re-locking it
 nav_locked_only         True   A* blocks only on LOCKED walls (unlocked >wall = penalised)
 merge_reconsider        False  EXPERIMENTAL: re-sense a wall a peer contradicts (net-negative)
+occlusion_block         True   drop observations whose ray crosses a locked wall (local mode)
 ```
 
 ## Net state after Part II
@@ -694,11 +731,12 @@ merge_reconsider        False  EXPERIMENTAL: re-sense a wall a peer contradicts 
   displaced walls and the agent surveys its way out of a seal instead of jittering.
   On the plain-selected A/B set: **27/30, mean ~0.39, worst-case ~5.3 cells.**
 - A new **all-features-on hard set** (`tools/sweep.py` STANDARD_SEEDS, selected to
-  surface remaining weaknesses) started at **14/30** and is at **17/30** with
-  `nav_locked_only` (§21) — the genuinely unsolved cases. The per-run diagnostics
-  split them into catastrophic-drift/recovery-thrash (true SLAM failures) and clean
-  stalls; the one pure-navigation livelock (bsp1011) is now fixed by §21. See
-  `docs/TESTING.md`.
+  surface remaining weaknesses) started at **14/30**, reached **17/30** with
+  `nav_locked_only` (§21), and is now at **27/30** with occlusion gating (§22) —
+  the single biggest win, which collapsed the catastrophic-drift cases (worst-case
+  error 21→2.5 cells). A fresh-random generalization batch scores **26/30** with
+  the same config, so the gains are not overfit to the curated seeds. Remaining
+  failures: room1089, room1071, cave1137.
 - The remaining `local` gap (and the residual maze aliasing from Part I) is still
   the same fundamental limit for the drift cases: **no loop closure / pose-graph
   back-end** — re-anchoring against the known start region on the return trip is

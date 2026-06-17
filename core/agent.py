@@ -131,6 +131,7 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         search_block_frac=config.get("search_block_frac", 0.5),
         search_linger=config.get("search_linger", 6),
         erosion_protect_steps=config.get("erosion_protect_steps", 30),
+        occlusion_block=config.get("occlusion_block", True),
     )
 
     # In "shared" map mode all agents reference the one grid held by the
