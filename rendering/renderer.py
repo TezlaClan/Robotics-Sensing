@@ -29,14 +29,33 @@ class Renderer:
 
         self.fig, self.ax = plt.subplots(figsize=(fig_size, fig_size))
 
+        # Closing the window sets this flag; the simulation polls is_closed() and
+        # terminates cleanly, instead of stepping on into a dead canvas (which is
+        # what forced the old "close window then spam Ctrl-C" dance).
+        self.closed = False
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+
         plt.ion()
         plt.show()
 
+    def _on_close(self, _event):
+        self.closed = True
+
+    def is_closed(self) -> bool:
+        return self.closed
+
     def render(self):
-        draw_frame(self.ax, self.environment, self.agents, self.layers, self.comm_range)
-        plt.tight_layout()
-        plt.pause(0.001)
+        if self.closed:
+            return
+        try:
+            draw_frame(self.ax, self.environment, self.agents, self.layers, self.comm_range)
+            plt.tight_layout()
+            plt.pause(0.001)
+        except Exception:
+            # Window was torn down mid-draw - treat as a close request.
+            self.closed = True
 
     def close(self):
         # Leave the final frame on screen but stop interactive mode.
-        plt.ioff()
+        if not self.closed:
+            plt.ioff()

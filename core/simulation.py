@@ -48,8 +48,12 @@ class Simulation:
 
         dprint("Starting simulation...")
 
-        while not self._should_terminate():
-            self._step()
+        try:
+            while not self._should_terminate():
+                self._step()
+        except KeyboardInterrupt:
+            # Ctrl-C: stop cleanly rather than dumping a traceback.
+            print("\nInterrupted - shutting down.")
 
         # Finalize outputs (e.g. flush/save the mp4).
         for renderer in self.renderers:
@@ -103,8 +107,8 @@ class Simulation:
                     renderer.render()
                 except Exception as e:
                     print(f"ERROR in renderer.render(): {e}")
-                import traceback
-                traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
 
     # =========================
     # Termination Conditions
@@ -122,7 +126,13 @@ class Simulation:
             print("Mission complete: goal reached and returned to start.")
             return True
 
-        # 3. All agents finished (fallback, e.g. single-agent runs)
+        # 3. Render window closed by the user -> stop cleanly.
+        for renderer in self.renderers:
+            if getattr(renderer, "is_closed", None) and renderer.is_closed():
+                print("Render window closed - stopping.")
+                return True
+
+        # 4. All agents finished (fallback, e.g. single-agent runs)
         try:
             if all(agent.finished for agent in self.agents):
                 print("All agents completed objective.")

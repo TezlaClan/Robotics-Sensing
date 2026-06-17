@@ -78,7 +78,7 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
     # =========================
     # Planner
     # =========================
-    planner = AStarPlanner()
+    planner = AStarPlanner(nav_locked_only=config.get("nav_locked_only", False))
 
     # =========================
     # Communication
@@ -95,6 +95,7 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         communication_range=config.get("communication_range", 10.0),
         packet_loss_rate=config.get("comm_packet_loss", 0.0),
         corruption_rate=config.get("comm_corruption", 0.0),
+        merge_reconsider=config.get("merge_reconsider", False),
         rng_manager=rng_manager
     )
 
@@ -122,6 +123,14 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         swarm_slam=config.get("swarm_slam", False),
         sensor_range_sigma=config.get("sensor_range_sigma", 0.0),
         map_anchor=config.get("map_anchor", "world"),
+        lock_erosion=config.get("lock_erosion", False),
+        lock_erosion_patience=config.get("lock_erosion_patience", 5),
+        search_recovery=config.get("search_recovery", True),
+        search_window=config.get("search_window", 30),
+        search_min_progress=config.get("search_min_progress", 1.5),
+        search_block_frac=config.get("search_block_frac", 0.5),
+        search_linger=config.get("search_linger", 6),
+        erosion_protect_steps=config.get("erosion_protect_steps", 30),
     )
 
     # In "shared" map mode all agents reference the one grid held by the

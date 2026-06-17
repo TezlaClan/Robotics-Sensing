@@ -133,6 +133,15 @@ CONFIG = {
     "map_update_step": 0.1,
     "map_lock_high": 0.9,
     "map_lock_low": 0.1,
+    # Lock erosion: normally a locked cell is frozen forever. With this on, a
+    # locked cell observed CONTRADICTING its locked state (a locked wall seen
+    # free, or a locked-free cell seen as wall) for `lock_erosion_patience`
+    # consecutive steps is unlocked and reset to unknown, so it can re-heal.
+    # Mainly for "local" map mode, where localization drift can place and freeze
+    # phantom walls; requiring consecutive contradictions keeps stray sensor
+    # noise from eroding correct cells.
+    "lock_erosion": True,
+    "lock_erosion_patience": 5,
 
     # =========================
     # Seeds
@@ -145,4 +154,49 @@ CONFIG = {
     # =========================
     "agent_radius": 0.25,
     "agent_speed": 2,
+
+    # =========================
+    # Recovery / search mode
+    # =========================
+    # When forward progress stalls because a (often phantom, local-mode) wall
+    # seals the way, the agent can oscillate in place: it keeps "moving" a little,
+    # so the zero-motion stuck timer never fires. Search mode catches this by
+    # tracking NET displacement of the believed pose over a window: if the agent
+    # has not netted `search_min_progress` cells over the last `search_window`
+    # steps, it enters a survey mode and heads to the FURTHEST reachable frontier,
+    # pathing around the known region so its boundary walls (incl. the phantom)
+    # get re-observed from new angles. Combined with lock erosion, that lets the
+    # phantom flip free again, after which it resumes onward. Mainly useful in
+    # "local" map mode.
+    "search_recovery": True,
+    "search_window": 30,          # steps of believed-pose history for the detector
+    "search_min_progress": 1.5,   # cells of net displacement below which = stalled
+    "search_block_frac": 0.5,     # min fraction of blocked steps in the window to
+                                  # count as a genuine seal (vs slow maneuvering)
+    "search_linger": 6,           # steps to dwell at a survey target so the sealing
+                                  # wall is observed long enough to erode (a single
+                                  # drive-by barely glimpses it). A target lingered
+                                  # at without opening a wall is not revisited, so a
+                                  # real wall is tried once then search moves on.
+
+    # Multi-agent erosion protection: after we erode a (phantom) wall, a peer that
+    # still holds it locked would re-impose and re-lock it on the next map merge,
+    # undoing the erosion (worse the more agents are nearby). Cells we eroded stay
+    # protected from a peer re-locking a wall there for this many steps.
+    "erosion_protect_steps": 30,
+
+    # Navigation: when True the A* planner blocks only on LOCKED (confirmed) walls;
+    # an unlocked >wall cell (still accumulating evidence, e.g. a transient phantom)
+    # is passable but penalised. A wall must be confirmed before it can seal a
+    # route, so phantoms that never lock never seal; real walls lock and block.
+    "nav_locked_only": True,
+
+    # Map merge: when an agent has a cell locked as a WALL that a peer confidently
+    # sees as free, distrust it and reset to unknown so sensing re-decides. EXPERIMENTAL,
+    # default OFF: measured net-negative on the hard set (16/30 vs 17/30 with it off,
+    # and it drags nav_locked_only down 17->16). Root cause is the local-mode frame
+    # mismatch - agents in different believed frames disagree on indices legitimately,
+    # so reconsidering removes correct geometry more often than it clears a phantom.
+    # Kept as an opt-in lever (it does cut worst-case drift: loc max 21->12).
+    "merge_reconsider": False,
 }

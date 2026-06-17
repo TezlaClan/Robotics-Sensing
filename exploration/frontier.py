@@ -153,6 +153,54 @@ class FrontierExploration:
 
         return None
 
+    def furthest_reachable_frontier(
+        self,
+        internal_map: List[List[float]],
+        start: GridPosition,
+        exclude=None,
+    ) -> Optional[GridPosition]:
+        """
+        BFS outward from `start` through known-free cells, returning the FURTHEST
+        frontier reachable (the last one reached in BFS order, which visits cells
+        in non-decreasing path distance). Used by search/survey mode to sweep the
+        agent across the known region's perimeter so its boundary walls get
+        re-observed. `exclude` is a set of frontier cells to skip (already surveyed
+        this episode) so search can move on instead of looping back. Returns None
+        if no eligible frontier is reachable through free space.
+        """
+        height = len(internal_map)
+        width = len(internal_map[0])
+        exclude = exclude or set()
+
+        sx, sy = start
+        if not (0 <= sx < width and 0 <= sy < height):
+            return None
+
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+        visited = {start}
+        queue = deque([start])
+        furthest = None
+
+        while queue:
+            cx, cy = queue.popleft()
+
+            if ((cx, cy) != start and (cx, cy) not in exclude
+                    and self.is_frontier(internal_map, (cx, cy))):
+                furthest = (cx, cy)  # BFS order is by distance, so last seen = far
+
+            for dx, dy in directions:
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                if (nx, ny) in visited:
+                    continue
+                if self._is_free(internal_map[ny][nx]):
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+
+        return furthest
+
     def nearest_unknown(
         self,
         internal_map: List[List[float]],

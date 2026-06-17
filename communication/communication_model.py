@@ -21,6 +21,7 @@ class CommunicationModel:
         communication_range: float = 10.0,
         packet_loss_rate: float = 0.0,
         corruption_rate: float = 0.0,
+        merge_reconsider: bool = False,
         rng_manager=None,
     ):
         self.mode = mode
@@ -28,6 +29,11 @@ class CommunicationModel:
 
         self.packet_loss_rate = packet_loss_rate
         self.corruption_rate = corruption_rate
+        # When two agents both have a cell LOCKED but disagree (wall vs free),
+        # distrust both: unlock and reset it so fresh sensing re-decides (and must
+        # re-accumulate before re-locking). Forces reconsideration of a contested
+        # wall instead of each agent silently keeping its own.
+        self.merge_reconsider = merge_reconsider
 
         self.rng_manager = rng_manager
         self.rng = rng_manager.behaviour_rng() if rng_manager else None
@@ -59,10 +65,13 @@ class CommunicationModel:
             # Send map (optionally corrupted in transit)
             received_map = self._transmit_map(other.internal_map)
 
-            # Merge: adopt the peer's CONFIDENT (locked) cells only.
+            # Merge: adopt the peer's CONFIDENT (locked) cells only. Cells we have
+            # recently eroded are protected, so a peer that still holds the old
+            # (phantom) wall can't re-impose and re-lock it and undo our erosion.
             mask_changed = self._merge_maps(
                 agent.internal_map, agent.locked,
                 received_map, other.locked,
+                protect=getattr(agent, "_eroded_cooldown", None),
             )
             # Wall mask changed -> invalidate the localizer's cached distance field.
             if mask_changed and hasattr(agent, "_wallver"):
@@ -131,8 +140,11 @@ class CommunicationModel:
 
     # Occupancy above which a cell counts as a wall (matches the localizer).
     _WALL = 0.6
+    # Below which a cell counts as confidently free (matches the planner/frontier).
+    _FREE = 0.4
 
-    def _merge_maps(self, target_map, target_locked, incoming_map, incoming_locked):
+    def _merge_maps(self, target_map, target_locked, incoming_map, incoming_locked,
+                    protect=None):
         """
         Confident-knowledge merge: adopt only the cells the sender has *locked*.
 
@@ -157,9 +169,30 @@ class CommunicationModel:
         for y in range(height):
             for x in range(width):
                 if target_locked[y][x]:
-                    continue  # our own confident knowledge stands
+                    # Contested WALL: we have a cell locked as a wall that a peer
+                    # confidently sees as free. Rather than silently keep our wall,
+                    # distrust it and re-sense (must re-accumulate before re-locking).
+                    # Asymmetric on purpose - we only reconsider our own *walls* a
+                    # peer contradicts (the phantom-wall case), never clear free
+                    # space, so a frame-mismatched peer can't open real walls.
+                    if (self.merge_reconsider and incoming_locked[y][x]
+                            and target_map[y][x] > self._WALL
+                            and incoming_map[y][x] <= self._WALL):
+                        target_locked[y][x] = False
+                        target_map[y][x] = 0.5
+                        mask_changed = True  # a believed wall is being cleared
+                    continue  # our own confident knowledge otherwise stands
                 if incoming_locked[y][x]:
                     inc = incoming_map[y][x]
+                    # Don't let a peer re-impose a WALL on a cell we recently eroded
+                    # *and still see as free*: our fresh local evidence wins until it
+                    # ages out. We require our own value to be free (< _FREE), so a
+                    # bad erosion (a real wall we re-sense as wall) is NOT protected
+                    # and the peer correctly restores it - only a confirmed-clear
+                    # phantom is shielded from being re-locked.
+                    if (protect and inc > self._WALL and (x, y) in protect
+                            and target_map[y][x] < self._FREE):
+                        continue
                     # Only a wall-threshold crossing matters to the localizer.
                     if (target_map[y][x] > self._WALL) != (inc > self._WALL):
                         mask_changed = True

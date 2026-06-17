@@ -121,6 +121,7 @@ class SLAMLocalization:
         self.max_gated_steps = 40
         self._last_est: Optional[Position] = None
         self._gate_count = 0
+        self._gate_total = 0  # cumulative gated-jump count (diagnostics)
 
     # =========================
     # Main API
@@ -190,6 +191,7 @@ class SLAMLocalization:
 
         if jump > allowed and self._gate_count < self.max_gated_steps:
             self._gate_count += 1
+            self._gate_total += 1
             self._reseed(predicted)
             return self._project_out_of_walls(predicted, internal_map)
 

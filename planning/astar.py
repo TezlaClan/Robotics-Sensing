@@ -19,8 +19,15 @@ GridPosition = Tuple[int, int]
 
 
 class AStarPlanner:
-    def __init__(self, agent_radius=0.3):
+    def __init__(self, agent_radius=0.3, nav_locked_only=False):
       self.agent_radius = agent_radius
+      # When True, only LOCKED (confirmed) believed-walls block navigation; an
+      # unlocked >wall cell (still accumulating evidence, e.g. a transient phantom
+      # from a drift episode) is passable-but-penalised. Collision handling on the
+      # TRUE map still stops real walls, so this is safe, and a wall must be
+      # confirmed (locked) before it can seal a route - phantoms that never lock
+      # never seal. Requires the `locked` grid to be passed to plan().
+      self.nav_locked_only = nav_locked_only
 
     # =========================
     # Main API
@@ -32,6 +39,7 @@ class AStarPlanner:
         goal: GridPosition,
         internal_map: List[List[float]],
         allow_walls: bool = False,
+        locked=None,
     ) -> List[GridPosition]:
         """
         Compute path from start to goal.
@@ -40,6 +48,9 @@ class AStarPlanner:
         a high cost, so the agent can push through a *suspected* wall (e.g. a
         noisy false-positive that sealed a corridor). Real walls still block in
         movement, so this is safe; phantom walls get re-observed and corrected.
+
+        locked: the agent's lock grid. With nav_locked_only set, only locked walls
+        block; unlocked >wall cells are traversable at a penalty.
         """
 
         height = len(internal_map)
@@ -80,8 +91,8 @@ class AStarPlanner:
                 dprint(f"[A*] Path found in {iterations} iterations: {len(path)} cells")
                 return path
 
-            for neighbour in self._get_neighbours(current, internal_map, allow_walls):
-                tentative_g = g_score[current] + self._cost(neighbour, internal_map, allow_walls)
+            for neighbour in self._get_neighbours(current, internal_map, allow_walls, locked):
+                tentative_g = g_score[current] + self._cost(neighbour, internal_map, allow_walls, locked)
 
                 if neighbour not in g_score or tentative_g < g_score[neighbour]:
                   came_from[neighbour] = current
@@ -99,16 +110,15 @@ class AStarPlanner:
     # Neighbour Logic
     # =========================
 
-    def _is_blocked(self, x, y, internal_map, inflation_radius):
+    def _is_blocked(self, x, y, internal_map, locked=None):
       """
-      Check if a cell is blocked (wall or unknown).
-      No inflation radius - just check the cell itself.
+      Check if a cell blocks navigation. A >wall cell normally blocks; with
+      nav_locked_only it blocks only once LOCKED (confirmed) - an unlocked >wall
+      cell is treated as passable here (the cost function penalises it).
       """
-      height = len(internal_map)
-      width = len(internal_map[0])
-
-      # Hard wall
       if internal_map[y][x] > 0.6:
+          if self.nav_locked_only and locked is not None and not locked[y][x]:
+              return False  # unconfirmed wall: don't block, route may use it
           return True
 
       return False
@@ -118,11 +128,11 @@ class AStarPlanner:
         node: GridPosition,
         internal_map: List[List[float]],
         allow_walls: bool = False,
+        locked=None,
     ) -> List:
       x, y = node
       width = len(internal_map[0])
       height = len(internal_map)
-      inflation_radius = self.agent_radius
 
       directions = [
           (1, 0), (-1, 0),
@@ -135,26 +145,21 @@ class AStarPlanner:
           nx, ny = x + dx, y + dy
 
           if 0 <= nx < width and 0 <= ny < height:
-              if allow_walls or not self._is_blocked(nx, ny, internal_map, inflation_radius):
+              if allow_walls or not self._is_blocked(nx, ny, internal_map, locked):
                   neighbours.append((nx, ny))
 
       if not neighbours:
           dprint(f"[A*] WARNING: No neighbours for node {node}!")
           dprint(f"[A*] Map prob at node: {internal_map[y][x]}")
-          for dx, dy in directions:
-              nx, ny = x + dx, y + dy
-              if 0 <= nx < width and 0 <= ny < height:
-                  blocked = self._is_blocked(nx, ny, internal_map, inflation_radius)
-                  prob = internal_map[ny][nx]
-                  dprint(f"[A*]   ({nx}, {ny}): prob={prob:.2f}, blocked={blocked}")
-      
+
       return neighbours
 
     # =========================
     # Cost Function
     # =========================
 
-    def _cost(self, node: GridPosition, internal_map, allow_walls: bool = False) -> float:
+    def _cost(self, node: GridPosition, internal_map, allow_walls: bool = False,
+              locked=None) -> float:
         """
         Uniform cost - all free cells cost the same.
         This encourages shortest path, not wall-hugging.
@@ -162,9 +167,16 @@ class AStarPlanner:
         x, y = node
         prob = internal_map[y][x]
 
-        # Believed wall: impassable normally, but very expensive (not infinite)
-        # in recovery mode so a free route is always preferred when one exists.
+        # Believed wall.
         if prob > 0.6:
+            # Unconfirmed (unlocked) wall under nav_locked_only: passable but
+            # penalised, so a confirmed-free route is preferred when one exists,
+            # yet the agent will route through a suspected phantom rather than
+            # treat it as a seal.
+            if self.nav_locked_only and locked is not None and not locked[y][x]:
+                return 5.0
+            # Confirmed wall: impassable normally, very expensive (not infinite)
+            # in recovery mode so a free route is always preferred when one exists.
             return 1000.0 if allow_walls else float("inf")
 
         # All free/unknown cells have equal cost

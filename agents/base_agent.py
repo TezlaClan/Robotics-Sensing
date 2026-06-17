@@ -53,6 +53,14 @@ class BaseAgent:
         swarm_slam: bool = False,
         sensor_range_sigma: float = 0.0,
         map_anchor: str = "world",
+        lock_erosion: bool = False,
+        lock_erosion_patience: int = 5,
+        search_recovery: bool = True,
+        search_window: int = 30,
+        search_min_progress: float = 1.5,
+        search_block_frac: float = 0.5,
+        search_linger: int = 6,
+        erosion_protect_steps: int = 30,
     ):
         self.id = agent_id
 
@@ -113,6 +121,20 @@ class BaseAgent:
             for _ in range(map_height)
         ]
 
+        # Lock erosion: a locked cell is normally frozen forever, which makes a
+        # wrongly-placed wall (e.g. a displaced/phantom wall from local-mode
+        # localization drift) permanent. With erosion on, a locked cell that is
+        # observed CONTRADICTING its locked state for `lock_erosion_patience`
+        # consecutive steps is unlocked and reset to unknown, so it can re-heal.
+        # Requiring consecutive contradictions makes a stray sensor false reading
+        # harmless (any consistent reading resets the counter).
+        self.lock_erosion = lock_erosion
+        self.lock_erosion_patience = lock_erosion_patience
+        self._contradict = [
+            [0 for _ in range(map_width)]
+            for _ in range(map_height)
+        ]
+
         self.map_width = map_width
         self.map_height = map_height
 
@@ -150,6 +172,58 @@ class BaseAgent:
         # Stuck detection / recovery
         self.stuck_steps = 0
         self.stuck_limit = 25  # consecutive no-progress steps before recovering
+
+        # Search mode: a phantom (often local-mode) wall can seal the way onward
+        # while the agent still twitches, so the zero-motion `stuck_steps` timer
+        # never fires and it oscillates forever. We detect the stall by NET
+        # displacement of the believed cell over a window, then survey the known
+        # region (head to the furthest reachable frontier) so the sealing wall is
+        # re-observed from new angles and lock erosion can clear it. See _plan.
+        self.search_recovery = search_recovery
+        self.search_window = search_window
+        self.search_min_progress = search_min_progress
+        self.search_block_frac = search_block_frac
+        # Steps to dwell at a survey target so the sealing wall is observed long
+        # enough to actually erode (a single drive-by barely glimpses it).
+        self.search_linger = search_linger
+        self.search_mode = False
+        self.search_target: Optional[GridPosition] = None
+        self._linger_steps = 0
+        # True on a step we are deliberately holding position to observe a target
+        # (lingering). Such a step is NOT "stuck" - it must not count toward the
+        # stuck timer or the blocked-step window, or the dwell would spuriously
+        # trip recovery and re-trigger search the moment it ends.
+        self._lingering = False
+        # Survey targets already lingered at this episode without opening a wall:
+        # do not loop back to them. A real (non-phantom) wall never erodes, so this
+        # is also what stops search from battering one forever - once every
+        # reachable frontier is exhausted, search gives up and yields to recovery.
+        self._search_visited: set = set()
+        self._pos_history: deque = deque(maxlen=max(2, search_window))
+        # Per-step "was movement physically blocked?" over the window. A genuine
+        # seal (oscillating against a wall) is blocked most steps; an agent merely
+        # maneuvering slowly is not - this is what separates a real stall from
+        # ordinary slow progress, so search mode doesn't fire on healthy runs.
+        self._blocked_history: deque = deque(maxlen=max(2, search_window))
+        # Set whenever a believed-wall is cleared (erosion / boundary reopen); the
+        # signal that a sealing phantom may have opened, so search mode can exit.
+        self._wall_removed = False
+
+        # Multi-agent erosion protection: when we erode a (phantom) wall, a peer
+        # that still has it locked would re-impose and re-lock it on the next map
+        # merge, instantly undoing the erosion - worse the more agents are nearby.
+        # Cells we recently eroded are protected (cell -> remaining steps) so a
+        # merge will not re-lock a wall there until our fresh local evidence ages
+        # out. See _merge_maps / communication_model.
+        self.erosion_protect_steps = erosion_protect_steps
+        self._eroded_cooldown: dict = {}
+
+        # Diagnostic counters ("how often did the agent decide the map was wrong").
+        # Read by the sweep harness; see tools/sweep.py.
+        self.n_recoveries = 0      # hard recoveries (unlock-all + reopen + step)
+        self.n_search_entries = 0  # times search mode was entered
+        self.n_erosions = 0        # locked cells eroded back to unknown
+        self.n_reopens = 0         # believed-walls reopened by boundary recovery
 
         # =========================
         # Status Flags
@@ -216,10 +290,22 @@ class BaseAgent:
         self._move(dt, environment)
 
         # Track lack of progress so _plan can trigger recovery if we get stuck.
-        if math.hypot(self.actual_motion[0], self.actual_motion[1]) < 1e-6:
+        # A deliberate linger (holding position to observe a target) is intentional,
+        # not a jam, so it counts as neither stuck nor blocked.
+        blocked = (math.hypot(self.actual_motion[0], self.actual_motion[1]) < 1e-6
+                   and not self._lingering)
+        if blocked:
             self.stuck_steps += 1
         else:
             self.stuck_steps = 0
+        # Windowed blocked-step record for the search-mode stall detector.
+        self._blocked_history.append(blocked)
+
+        # Age out erosion protection for recently-eroded cells.
+        if self._eroded_cooldown:
+            self._eroded_cooldown = {
+                c: t - 1 for c, t in self._eroded_cooldown.items() if t > 1
+            }
 
         # 6. Communication
         self.communication_model.communicate(self, agents)
@@ -303,6 +389,27 @@ class BaseAgent:
             if not (0 <= x < self.map_width and 0 <= y < self.map_height):
                 continue
             if self.locked[y][x]:
+                # Lock erosion: a locked cell is otherwise frozen forever. If we
+                # keep observing it contradicting its locked state, stop trusting
+                # the lock - unlock and reset to unknown so it can re-accumulate.
+                if self.lock_erosion:
+                    val = self.internal_map[y][x]
+                    contradict = ((val > WALL_THR and not occupied)
+                                  or (val < 1.0 - WALL_THR and occupied))
+                    if contradict:
+                        self._contradict[y][x] += 1
+                        if self._contradict[y][x] >= self.lock_erosion_patience:
+                            self.locked[y][x] = False
+                            self._contradict[y][x] = 0
+                            self.n_erosions += 1
+                            if val > WALL_THR:
+                                mask_changed = True       # wall removed from mask
+                                self._wall_removed = True  # phantom wall cleared
+                                # Protect from a peer re-imposing this wall on merge.
+                                self._eroded_cooldown[(x, y)] = self.erosion_protect_steps
+                            self.internal_map[y][x] = 0.5  # reset to unknown
+                    else:
+                        self._contradict[y][x] = 0  # consistent reading -> trust the lock
                 continue
 
             before = self.internal_map[y][x]
@@ -341,12 +448,32 @@ class BaseAgent:
 
         agent_cell = self._to_grid(self.believed_position)
         recovery = False  # set when pushing through believed-walls to escape a seal
+        self._lingering = False  # set True only while dwelling in _plan_search
+
+        # Track net progress of the believed pose so we can detect a stall that
+        # the zero-motion `stuck_steps` timer misses: an agent oscillating against
+        # a (phantom) wall keeps twitching, so it never looks "frozen", yet it gets
+        # nowhere. `stalled` is true once the window is full and the agent has not
+        # netted `search_min_progress` cells over it.
+        self._pos_history.append(agent_cell)
+        stalled = (
+            self.search_recovery
+            and len(self._pos_history) == self._pos_history.maxlen
+            and self._net_progress() < self.search_min_progress
+            and self._blocked_fraction() >= self.search_block_frac
+        )
 
         # =========================
         # Recovery if frozen too long (any mission phase)
         # =========================
         if self.stuck_steps >= self.stuck_limit:
             self.stuck_steps = 0
+            self.n_recoveries += 1
+            # A hard recovery means search mode (if it was running) did not free us;
+            # reset it so it starts fresh afterwards.
+            self.search_mode = False
+            self._search_visited.clear()
+            self._linger_steps = 0
             # 0. Unlock every cell so a wrongly-locked value can't keep us stuck;
             #    sensing will re-establish locks as evidence re-accumulates.
             self._unlock_all()
@@ -364,6 +491,34 @@ class BaseAgent:
                 self.current_path = [step_cell]
                 self.steps_since_replan = 0
                 return
+
+        # =========================
+        # Search mode (stalled against a sealing wall)
+        # =========================
+        # Exit as soon as a believed-wall is cleared: the sealing phantom may have
+        # just opened, so let normal planning re-evaluate the way onward. If it is
+        # still blocked, the stall detector simply re-arms and we come back.
+        if self.search_mode and self._wall_removed:
+            self._exit_search()
+        self._wall_removed = False
+        # Enter when stalled (oscillating/frozen with no net progress).
+        if self.search_recovery and stalled and not self.search_mode:
+            self.search_mode = True
+            self.search_target = None
+            self._linger_steps = 0
+            self._search_visited.clear()
+            self.n_search_entries += 1
+            self._pos_history.clear()
+
+        if self.search_mode:
+            if self._plan_search(environment):
+                return
+            # Nothing left to survey: every reachable frontier was lingered at
+            # without opening a wall (the seal is a real wall, or the region is
+            # fully explored). Drop search mode and fall through to normal planning,
+            # whose own fallback pushes toward the nearest unknown across believed-
+            # walls; a persistent freeze there is caught by the zero-motion timer.
+            self._exit_search()
 
         # =========================
         # Mission phase target selection
@@ -431,7 +586,8 @@ class BaseAgent:
                 agent_cell,
                 self.current_target,
                 self.internal_map,
-                allow_walls=recovery
+                allow_walls=recovery,
+                locked=self.locked,
             )
 
             if self.current_path:
@@ -448,6 +604,100 @@ class BaseAgent:
         if checker is None:
             return True
         return checker(self.internal_map, target)
+
+    def _net_progress(self) -> float:
+        """Net displacement (cells) from the oldest believed cell in the window
+        to the current one. Small for both a frozen and an oscillating agent."""
+        if len(self._pos_history) < 2:
+            return float("inf")
+        ox, oy = self._pos_history[0]
+        cx, cy = self._pos_history[-1]
+        return math.hypot(cx - ox, cy - oy)
+
+    def _blocked_fraction(self) -> float:
+        """Fraction of the recent window in which movement was physically
+        blocked (zero actual motion). High while jammed against a wall."""
+        if not self._blocked_history:
+            return 0.0
+        return sum(self._blocked_history) / len(self._blocked_history)
+
+    def _exit_search(self):
+        """Leave search mode and clear its episode state."""
+        self.search_mode = False
+        self.search_target = None
+        self._linger_steps = 0
+        self._search_visited.clear()
+        self._pos_history.clear()
+
+    def _plan_search(self, environment) -> bool:
+        """
+        Search/survey mode. When forward progress is sealed off (typically a
+        phantom wall the agent oscillates against), stop battering the same spot
+        and instead patrol the known region by heading to the FURTHEST reachable
+        frontier through known-free space. Sweeping the region's perimeter
+        re-observes its boundary walls - including the phantom - from new angles,
+        so lock erosion can contradict and clear it; once a wall is cleared the
+        caller leaves search mode and resumes onward.
+
+        On arrival at a survey target the agent LINGERS for `search_linger` steps
+        so the sealing wall is observed long enough to actually erode (a single
+        drive-by barely glimpses it). A target lingered at without opening a wall
+        is marked visited and not revisited this episode - so a real (non-erodible)
+        wall is tried once, then search moves on, and once every reachable frontier
+        is exhausted it gives up (returns False) instead of battering forever.
+
+        Returns True if a survey target/path was set (or we are lingering), False
+        if nothing is left to survey (caller falls back to normal/hard recovery).
+        """
+        agent_cell = self._to_grid(self.believed_position)
+
+        # Arrived at the current target -> dwell so it gets properly observed.
+        if self.search_target is not None and agent_cell == self.search_target:
+            if self._linger_steps < self.search_linger:
+                self._linger_steps += 1
+                self._lingering = True   # intentional dwell, not a jam
+                self.current_path = []   # hold position; the sensor still fires
+                return True
+            # Done dwelling and the wall did not open (else we'd have exited on
+            # _wall_removed): treat it as not-worth-revisiting this episode.
+            self._search_visited.add(self.search_target)
+            self.search_target = None
+            self._linger_steps = 0
+
+        # (Re)pick a far survey target when we have none or it stopped being a
+        # frontier (its unknown neighbours got sensed), skipping visited ones.
+        if self.search_target is None or not self._target_is_frontier(self.search_target):
+            chooser = getattr(
+                self.exploration_strategy, "furthest_reachable_frontier", None
+            )
+            self.search_target = (
+                chooser(self.internal_map, agent_cell, exclude=self._search_visited)
+                if chooser else None
+            )
+            self.current_path = []
+            self.steps_since_replan = 0
+
+        if self.search_target is None:
+            return False
+
+        self.current_target = self.search_target
+
+        # Replan to the survey target through known-free space (never across
+        # believed-walls: we are deliberately staying inside the known region).
+        if not self.current_path or self.steps_since_replan >= self.replan_interval:
+            self.steps_since_replan = 0
+            self.current_path = self.planner.plan(
+                agent_cell, self.current_target, self.internal_map,
+                allow_walls=False, locked=self.locked,
+            )
+            if not self.current_path:
+                # Target unreachable after all (e.g. it sat behind a wall that has
+                # since closed). Mark visited so we don't reselect it, then re-pick.
+                self._search_visited.add(self.search_target)
+                self.search_target = None
+                return False
+
+        return True
 
     def _reopen_boundary(self, agent_cell) -> int:
         """
@@ -486,6 +736,8 @@ class BaseAgent:
         if boundary:
             # Reopened cells were believed-walls (>0.6) reset to 0.5: mask changed.
             self._wallver[0] += 1
+            self._wall_removed = True
+            self.n_reopens += len(boundary)
 
         return len(boundary)
 
