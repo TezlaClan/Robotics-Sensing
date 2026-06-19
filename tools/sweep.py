@@ -38,6 +38,7 @@ from config import CONFIG
 from utils.random_manager import RandomManager
 from core.environment import Environment
 from core.agent import create_agent
+from planning.astar import true_path_distance
 from communication.swarm_coordinator import SwarmCoordinator
 
 from maps.room_generator import RoomGenerator
@@ -56,24 +57,52 @@ GENS = {
     "obstacle": ObstacleGenerator,
 }
 
-# Curated standard regression set: a STRATIFIED hard set (failures + hard-but-
-# solvable + an easy guard) per map, found by tools/sweep.py --select over the
-# fresh pool 1000-1059 under the established baseline (see docs/TESTING.md). Kept
-# in source so the standard sweep is reproducible. Map -> list of seeds.
-# Curated hard set, selected by `--select` over pool 1000-1149 (150/map) with ALL
-# recovery features ON (the shipped default). These are the seeds that are STILL
-# hard with everything enabled - i.e. the system's remaining weaknesses - mostly
-# genuine failures + hardest-solvable, plus a couple of easy guards per map for
-# regression detection. Use it to track real failure modes and verify fixes.
-# NOTE: because it was selected under the full default config it is biased toward
-# that config's failures; for an unbiased feature-vs-feature A/B, re-select under
-# the plain config (search+erosion off) - see docs/TESTING.md. Failure counts in
-# the 150-seed pool: room 7, bsp 1, cave 16 (cave is the hard map).
-STANDARD_SEEDS = {
-    "room": [1031, 1034, 1089, 1071, 1093, 1074, 1055, 1040, 1014, 1092],
-    "bsp":  [1011, 1098, 1010, 1111, 1063, 1103, 1128, 1027, 1144, 1083],
-    "cave": [1116, 1087, 1000, 1137, 1067, 1019, 1055, 1058, 1124, 1064],
+# Curated sets, cut from searches over seeds 2000-23xx with behaviour_seed =
+# map_seed and all recovery features ON (room/bsp/cave: 999-run search; maze:
+# separate 400-run search). Replay any seed by setting BOTH map_seed and
+# behaviour_seed to it. Select with `--set {easy,hard,impossible}` (default hard).
+# See docs/TESTING.md. maze is by far the hardest (160/400 complete) - all-
+# corridor geometry makes the along-corridor belief offset unobservable.
+#
+# EASY = fastest completers per map (all < 400 steps; slowest member 66 steps).
+# A quick ~100%-completion regression check to run BEFORE the harder sets.
+EASY_SEEDS = {
+    "room": [2123, 2127, 2147, 2204, 2225, 2321],
+    "bsp":  [2013, 2084, 2155, 2168, 2264, 2296],
+    "cave": [2035, 2052, 2164, 2166, 2207, 2219],
+    "maze": [2056, 2169, 2272, 2275, 2328, 2346],
 }
+
+# HARD = slowest completers (balanced per map) + failures spread across "closeness
+# to finishing" (75% returning ... 0% never-reached-goal), ~half/half. A
+# discriminating regression set: failures can be rescued, slow completers can
+# regress into failures. maze adds 5 slow completers + 5 spread failures.
+HARD_SEEDS = {
+    "room": [2149, 2167, 2219, 2223, 2247, 2260, 2262, 2274, 2297, 2299, 2302, 2315],
+    "bsp":  [2065, 2080, 2289, 2327, 2332],
+    "cave": [2001, 2008, 2019, 2031, 2038, 2062, 2081, 2155, 2158, 2217, 2251, 2285, 2304],
+    "maze": [2022, 2069, 2090, 2138, 2235, 2252, 2266, 2352, 2387, 2391],
+}
+
+# IMPOSSIBLE = seeds that FAILED at behaviour=map. room 12, bsp 1, cave 17 (3% of
+# the 999-run search) + a representative closeness-spread of 30 maze failures (maze
+# failed 240/400 - too many to list all; the persisted slice is sampled across
+# closeness, full list reproducible via /tmp searches). Not literally unsolvable
+# (most are behaviour-specific), but the genuinely hard cases - use it to hunt
+# remaining failure modes and confirm a fix rescues them.
+IMPOSSIBLE_SEEDS = {
+    "room": [2018, 2069, 2149, 2163, 2167, 2223, 2230, 2262, 2274, 2299, 2302, 2304],
+    "bsp":  [2205],
+    "cave": [2001, 2010, 2019, 2038, 2062, 2081, 2119, 2134, 2154, 2155,
+             2175, 2183, 2190, 2251, 2263, 2285, 2328],
+    "maze": [2005, 2009, 2013, 2021, 2042, 2060, 2064, 2075, 2095, 2122,
+             2128, 2142, 2159, 2168, 2178, 2197, 2219, 2237, 2261, 2287,
+             2294, 2307, 2318, 2326, 2339, 2361, 2371, 2387, 2391, 2396],
+}
+
+SEED_SETS = {"easy": EASY_SEEDS, "hard": HARD_SEEDS, "impossible": IMPOSSIBLE_SEEDS}
+# Back-compat alias: the default set is the hard set.
+STANDARD_SEEDS = HARD_SEEDS
 
 
 def run_one(task):
@@ -174,6 +203,46 @@ def run_one(task):
                 "tracks": tracks,
             }, fh)
 
+    # Mission progress in [0,1] = "how close to finishing" (the mission is
+    # start -> goal -> start). 1.0 = completed. For a failure: the first half is
+    # reaching the goal, the second half is returning to start, graded by the
+    # claimer's remaining distance. Distances are TRUE shortest-path lengths over
+    # the known map (an A* oracle), not straight-line: in a maze the goal can be a
+    # few cells away straight-line yet hundreds of cells along the only free path,
+    # so straight-line progress was badly misleading. `opt_dist` is the one-way
+    # oracle distance start->goal (how far the goal actually is).
+    sgx, sgy = map_obj.start
+    ggx, ggy = map_obj.goal
+    opt_dist = true_path_distance(map_obj, (sgx, sgy), (ggx, ggy))
+    D = opt_dist if opt_dist not in (0.0, float("inf")) else \
+        (math.hypot(sgx - ggx, sgy - ggy) or 1.0)
+    claimer = next((a for a in agents if a.id == coord.goal_claimer), None)
+
+    def _remaining(target_cell):
+        """Oracle path distance from the claimer's true cell to a target cell,
+        falling back to straight-line if it is momentarily unreachable."""
+        cell = (int(claimer.true_position[0]), int(claimer.true_position[1]))
+        d = true_path_distance(map_obj, cell, target_cell)
+        if d == float("inf"):
+            d = math.hypot(claimer.true_position[0] - (target_cell[0] + 0.5),
+                           claimer.true_position[1] - (target_cell[1] + 0.5))
+        return d
+
+    if coord.mission_complete:
+        progress = 1.0
+        reached_goal = True
+    elif claimer is None:
+        progress = 0.0          # goal never even discovered/claimed
+        reached_goal = False
+    elif getattr(claimer, "reached_goal", False):
+        rem = _remaining((sgx, sgy))                            # returning leg
+        progress = max(0.0, min(1.0, (2 * D - rem) / (2 * D)))
+        reached_goal = True
+    else:
+        rem = _remaining((ggx, ggy))                            # outbound leg
+        progress = max(0.0, min(0.5, (D - rem) / (2 * D)))
+        reached_goal = False
+
     # map warp: cells an agent has DECIDED (<0.4 free / >0.6 wall) that disagree
     # with ground truth, averaged over agents.
     warp_total = 0
@@ -204,6 +273,9 @@ def run_one(task):
         "erosions": n_erosions,
         "reopens": n_reopens,
         "gates": n_gates,
+        "progress": progress,
+        "reached_goal": reached_goal,
+        "opt_dist": opt_dist,
     }
 
 
@@ -272,9 +344,12 @@ def summarize(results, maps, label, wall, jobs, per_run=False, track_dir=None):
 
     if per_run:
         for r in sorted(results, key=lambda r: (r["map_type"], r["seed"])):
+            od = r.get("opt_dist", float("inf"))
+            od_s = f"{od:.0f}" if od != float("inf") else "inf"
             print(f"{r['map_type']}{r['seed']:<6} "
                   f"{'DONE' if r['completed'] else 'FAIL'} "
-                  f"steps={r['steps']:4d} err={r['err_mean']:.2f}/{r['err_max']:.2f} "
+                  f"steps={r['steps']:4d} opt={od_s:>4} prog={r['progress']:.2f} "
+                  f"err={r['err_mean']:.2f}/{r['err_max']:.2f} "
                   f"warp={r['warp']:4.1f} "
                   f"rec={r['recoveries']} srch={r['searches']} "
                   f"ero={r['erosions']} reop={r['reopens']} gate={r['gates']} "
@@ -304,11 +379,16 @@ def summarize(results, maps, label, wall, jobs, per_run=False, track_dir=None):
 
 def main():
     ap = argparse.ArgumentParser(description="Parallel empirical sweep.")
-    ap.add_argument("--maps", default="room,bsp,cave",
-                    help="comma list of map types")
+    ap.add_argument("--maps", default=None,
+                    help="comma list of map types (default: the map keys of the "
+                         "selected --set, or room,bsp,cave with explicit --seeds)")
     ap.add_argument("--seeds", default=None,
                     help="seed spec, e.g. '1-20' or '1000-1099'. "
-                         "Default: the curated STANDARD_SEEDS per map.")
+                         "Default: the curated seeds for --set.")
+    ap.add_argument("--set", dest="seed_set", default="hard",
+                    choices=list(SEED_SETS),
+                    help="which curated set to run when --seeds is not given "
+                         "(hard | impossible; default hard)")
     ap.add_argument("--overrides", default="{}",
                     help="JSON config overrides")
     ap.add_argument("--agents", type=int, default=None,
@@ -340,14 +420,19 @@ def main():
     if args.agents is not None:
         overrides["num_agents"] = args.agents
 
-    maps = [m.strip() for m in args.maps.split(",") if m.strip()]
-
+    curated = SEED_SETS[args.seed_set]
+    if args.maps:
+        maps = [m.strip() for m in args.maps.split(",") if m.strip()]
+    elif args.seeds is None:
+        maps = list(curated.keys())          # run every map the set covers
+    else:
+        maps = ["room", "bsp", "cave"]
     tasks = []
     for m in maps:
         if args.seeds is not None:
             seeds = parse_seeds(args.seeds)
         else:
-            seeds = STANDARD_SEEDS.get(m, list(range(1, 21)))
+            seeds = curated.get(m, [])
         for s in seeds:
             tasks.append({
                 "map_type": m,
@@ -381,7 +466,7 @@ def main():
 
     # ---- standard / curated report ----
     print(f"overrides: {overrides}")
-    seeds_label = "STANDARD" if args.seeds is None else args.seeds
+    seeds_label = args.seed_set.upper() if args.seeds is None else args.seeds
     summarize(results, maps, f"{seeds_label} seeds ({len(results)} runs)",
               wall, args.jobs, args.per_run, args.track_paths)
 

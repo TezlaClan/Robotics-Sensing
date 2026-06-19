@@ -11,6 +11,7 @@ Supports:
 
 import heapq
 import math
+from collections import deque
 from typing import Tuple, List, Dict, Optional
 
 from utils.debug import dprint
@@ -18,8 +19,57 @@ from utils.debug import dprint
 GridPosition = Tuple[int, int]
 
 
+def true_path_distance(map_obj, start_cell, goal_cell):
+    """
+    A* over the TRUE map (full knowledge): the shortest 4-connected free-space
+    path length, in cells, from start_cell to goal_cell. Returns float("inf") if
+    no path exists.
+
+    This is an ORACLE distance for measurement only - it sees the whole map, so it
+    reports exactly how far the goal is along the geometry the agent must navigate
+    (4-connected, matching the planner), not the straight-line distance. In a maze
+    the two differ enormously: the goal can be a few cells away in a straight line
+    yet hundreds of cells away along the only free path. Not used by the agents.
+    """
+    sx, sy = start_cell
+    gx, gy = goal_cell
+    w, h = map_obj.width, map_obj.height
+    grid = map_obj.grid
+
+    if not (0 <= sx < w and 0 <= sy < h and 0 <= gx < w and 0 <= gy < h):
+        return float("inf")
+    if grid[sy][sx] == 1 or grid[gy][gx] == 1:
+        return float("inf")
+    if (sx, sy) == (gx, gy):
+        return 0.0
+
+    def heur(x, y):
+        return abs(x - gx) + abs(y - gy)  # Manhattan: admissible on a 4-grid
+
+    open_set = [(heur(sx, sy), 0, (sx, sy))]
+    g_score = {(sx, sy): 0}
+
+    while open_set:
+        _, g, (cx, cy) = heapq.heappop(open_set)
+        if (cx, cy) == (gx, gy):
+            return float(g)
+        if g > g_score.get((cx, cy), float("inf")):
+            continue  # stale heap entry
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h and grid[ny][nx] == 0:
+                ng = g + 1
+                if ng < g_score.get((nx, ny), float("inf")):
+                    g_score[(nx, ny)] = ng
+                    heapq.heappush(open_set, (ng + heur(nx, ny), ng, (nx, ny)))
+
+    return float("inf")
+
+
 class AStarPlanner:
-    def __init__(self, agent_radius=0.3, nav_locked_only=False):
+    def __init__(self, agent_radius=0.3, nav_locked_only=False,
+                 wall_affinity=False, wall_affinity_weight=1.0,
+                 wall_affinity_comfort=None, sensor_range=8.0):
       self.agent_radius = agent_radius
       # When True, only LOCKED (confirmed) believed-walls block navigation; an
       # unlocked >wall cell (still accumulating evidence, e.g. a transient phantom
@@ -28,6 +78,24 @@ class AStarPlanner:
       # confirmed (locked) before it can seal a route - phantoms that never lock
       # never seal. Requires the `locked` grid to be passed to plan().
       self.nav_locked_only = nav_locked_only
+
+      # Wall-affinity (perception-aware planning). In open maps (caves) the SLAM
+      # filter has no geometry to localize against when no walls are in sensor
+      # range, so the believed pose drifts. When on, routing through a cell whose
+      # nearest believed wall is FURTHER than `wall_affinity_comfort` cells is
+      # penalised (linearly in the excess distance), biasing paths to keep walls
+      # within sensing range so the filter stays constrained. It is a SOFT penalty,
+      # not a hard constraint: when no near-wall route to the target exists (the
+      # goal is out in the open), A* still returns the least-penalty path - so the
+      # constraint effectively lifts itself rather than failing to plan. Off in
+      # recovery (allow_walls) mode. Default off until an A/B supports it.
+      self.wall_affinity = wall_affinity
+      self.wall_affinity_weight = wall_affinity_weight
+      # Cells with a wall within this many cells incur no penalty; default to the
+      # sensor range (a wall must merely be sensible).
+      self.wall_affinity_comfort = (
+          sensor_range if wall_affinity_comfort is None else wall_affinity_comfort
+      )
 
     # =========================
     # Main API
@@ -71,6 +139,12 @@ class AStarPlanner:
 
         dprint(f"[A*] Planning from {start} to {goal}")
 
+        # Perception-aware wall-distance field (only when affinity is active and
+        # we are not in wall-crossing recovery). Computed once per plan, O(W*H).
+        wall_dist = None
+        if self.wall_affinity and not allow_walls:
+            wall_dist = self._wall_distance_field(internal_map)
+
         open_set = []
         heapq.heappush(open_set, (0, start))
 
@@ -92,7 +166,7 @@ class AStarPlanner:
                 return path
 
             for neighbour in self._get_neighbours(current, internal_map, allow_walls, locked):
-                tentative_g = g_score[current] + self._cost(neighbour, internal_map, allow_walls, locked)
+                tentative_g = g_score[current] + self._cost(neighbour, internal_map, allow_walls, locked, wall_dist)
 
                 if neighbour not in g_score or tentative_g < g_score[neighbour]:
                   came_from[neighbour] = current
@@ -159,10 +233,12 @@ class AStarPlanner:
     # =========================
 
     def _cost(self, node: GridPosition, internal_map, allow_walls: bool = False,
-              locked=None) -> float:
+              locked=None, wall_dist=None) -> float:
         """
-        Uniform cost - all free cells cost the same.
-        This encourages shortest path, not wall-hugging.
+        Uniform cost - all free cells cost the same, EXCEPT when wall-affinity is
+        active: a free cell whose nearest believed wall is beyond the comfort
+        radius is penalised in proportion to the excess distance, so routes prefer
+        to keep walls within sensing range (better localization in open areas).
         """
         x, y = node
         prob = internal_map[y][x]
@@ -179,8 +255,65 @@ class AStarPlanner:
             # in recovery mode so a free route is always preferred when one exists.
             return 1000.0 if allow_walls else float("inf")
 
-        # All free/unknown cells have equal cost
+        # Free/unknown cell: base cost 1, plus the wall-affinity penalty (if any).
+        if wall_dist is not None:
+            return 1.0 + self.wall_affinity_weight * wall_dist[y][x]
         return 1.0
+
+    def _wall_distance_field(self, internal_map) -> List[List[float]]:
+        """
+        Per-cell wall-affinity PENALTY field (0 = pose well-constrained here).
+
+        What matters for localization is not nearness to *a* wall but having walls
+        across DIFFERENT axes within sensing range. A lone nearby wall (or hugging
+        one flat wall) leaves motion *along* that wall unconstrained - the corridor
+        aperture problem - and in practice makes drift worse, not better. So this
+        scores each free cell by per-axis wall coverage: for the x-axis, the nearer
+        wall scanning left/right; for the y-axis, the nearer wall scanning up/down
+        (both capped at the sensor range). An axis with no wall within `comfort`
+        contributes a penalty equal to its excess distance; a cell with a wall in
+        range on BOTH axes (a corner / junction / narrow spot, where pose is fully
+        pinned) gets 0. The open middle of a long corridor - where along-corridor
+        drift happens - is penalised on its open axis, biasing routes toward the
+        structure that actually constrains the filter.
+        """
+        height = len(internal_map)
+        width = len(internal_map[0])
+        comfort = self.wall_affinity_comfort
+        rng = int(comfort) + 1  # how far to scan for a wall before giving up
+        pen = [[0.0] * width for _ in range(height)]
+
+        def axis_dist(x, y, dx, dy):
+            """Cells to the nearest wall in +/- (dx,dy) from (x,y); rng+1 if none."""
+            best = rng + 1
+            for sx, sy in ((dx, dy), (-dx, -dy)):
+                cx, cy = x + sx, y + sy
+                d = 1
+                while 0 <= cx < width and 0 <= cy < height and d <= rng:
+                    if internal_map[cy][cx] > 0.6:
+                        if d < best:
+                            best = d
+                        break
+                    cx += sx
+                    cy += sy
+                    d += 1
+            return best
+
+        for y in range(height):
+            row = internal_map[y]
+            for x in range(width):
+                if row[x] > 0.6:
+                    continue  # walls don't get a free-cell penalty
+                xd = axis_dist(x, y, 1, 0)
+                yd = axis_dist(x, y, 0, 1)
+                p = 0.0
+                if xd > comfort:
+                    p += xd - comfort
+                if yd > comfort:
+                    p += yd - comfort
+                if p:
+                    pen[y][x] = p
+        return pen
 
 
     # =========================

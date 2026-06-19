@@ -73,12 +73,20 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
     # =========================
     # Exploration
     # =========================
-    exploration = FrontierExploration()
+    exploration = FrontierExploration(
+        gain_weight=config.get("frontier_gain_weight", 0.0)
+    )
 
     # =========================
     # Planner
     # =========================
-    planner = AStarPlanner(nav_locked_only=config.get("nav_locked_only", False))
+    planner = AStarPlanner(
+        nav_locked_only=config.get("nav_locked_only", False),
+        wall_affinity=config.get("nav_wall_affinity", False),
+        wall_affinity_weight=config.get("nav_wall_affinity_weight", 1.0),
+        wall_affinity_comfort=config.get("nav_wall_affinity_comfort", None),
+        sensor_range=config["sensor_range"],
+    )
 
     # =========================
     # Communication
@@ -132,6 +140,8 @@ def create_agent(agent_id, start_pos, map_width, map_height, rng_manager, config
         search_linger=config.get("search_linger", 6),
         erosion_protect_steps=config.get("erosion_protect_steps", 30),
         occlusion_block=config.get("occlusion_block", True),
+        stuck_progress_window=config.get("stuck_progress_window", 80),
+        stuck_progress_min=config.get("stuck_progress_min", 2.0),
     )
 
     # In "shared" map mode all agents reference the one grid held by the

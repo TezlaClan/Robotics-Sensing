@@ -20,9 +20,15 @@ GridPosition = Tuple[int, int]
 
 
 class FrontierExploration:
-    def __init__(self):
+    def __init__(self, gain_weight: float = 0.0):
         self.visited_targets = set()
         self.target_count = 0
+        # Frontier selection: 0 = pure nearest (greedy). >0 trades expected
+        # information gain (unknown cells around the frontier) against travel
+        # distance, so an agent prefers frontiers that reveal more per step rather
+        # than nibbling the closest. EXPERIMENTAL - gated behind an A/B (avg steps
+        # must fall with no completion/accuracy regression).
+        self.gain_weight = gain_weight
 
     # =========================
     # Main API
@@ -86,15 +92,22 @@ class FrontierExploration:
                 queue.append(cell)
 
         my_start = agent._to_grid(agent.believed_position)
-        best = None  # nearest frontier owned by this agent (BFS order == distance)
+        owned = []   # (order, cell) for this agent's frontiers, BFS order = distance
+        order = 0
 
         while queue:
             cx, cy = queue.popleft()
             cell = (cx, cy)
 
-            if (best is None and owner[cell] == agent.id
-                    and cell != my_start and self.is_frontier(internal_map, cell)):
-                best = cell
+            if (owner[cell] == agent.id and cell != my_start
+                    and self.is_frontier(internal_map, cell)):
+                # Pure-nearest (gain_weight == 0): the first owned frontier in BFS
+                # order IS the nearest, so return it immediately - identical to the
+                # previous behaviour.
+                if self.gain_weight <= 0:
+                    return cell
+                owned.append((order, cell))
+                order += 1
 
             for dx, dy in directions:
                 nx, ny = cx + dx, cy + dy
@@ -108,10 +121,30 @@ class FrontierExploration:
                     owner[(nx, ny)] = owner[cell]
                     queue.append((nx, ny))
 
-        if best is not None:
-            return best
-        # Own no frontier in our region: take the nearest reachable one anyway.
-        return self._nearest_reachable_frontier(internal_map, my_start)
+        if not owned:
+            # Own no frontier in our region: take the nearest reachable one anyway.
+            return self._nearest_reachable_frontier(internal_map, my_start)
+
+        # Gain-weighted: minimise (distance proxy) - gain_weight * (info gain).
+        best_cell, best_score = None, None
+        for o, cell in owned:
+            score = o - self.gain_weight * self._info_gain(internal_map, cell)
+            if best_score is None or score < best_score:
+                best_score, best_cell = score, cell
+        return best_cell
+
+    def _info_gain(self, internal_map, cell) -> int:
+        """Cheap expected-gain proxy: unknown cells in the 3x3 around `cell`."""
+        x, y = cell
+        h = len(internal_map)
+        w = len(internal_map[0])
+        g = 0
+        for ny in range(max(0, y - 1), min(h, y + 2)):
+            row = internal_map[ny]
+            for nx in range(max(0, x - 1), min(w, x + 2)):
+                if self._is_unknown(row[nx]):
+                    g += 1
+        return g
 
     def _nearest_reachable_frontier(
         self,

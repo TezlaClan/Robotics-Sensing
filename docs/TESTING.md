@@ -28,7 +28,7 @@ PYTHONPATH=. MPLBACKEND=Agg .venv/bin/python tools/sweep.py \
 Flags: `--maps`, `--seeds` (`a-b` or `a,b,c`; default = curated set),
 `--overrides` (JSON config patch), `--agents`, `--map-size`, `--max-steps`,
 `-j/--jobs` (default = all cores), `--per-run`, `--select N`, `--track-paths DIR`,
-`--random N` / `--random-seed S`.
+`--random N` / `--random-seed S`, `--set {easy,hard,impossible}`.
 
 ### Generalization batch (overfit check)
 
@@ -45,6 +45,25 @@ Reported metrics: completion (overall + per map), localization error mean/max,
 map-warp (decided cells disagreeing with ground truth, per agent), avg steps,
 **compute ms/agent-step** (per-run CPU, comparable regardless of `-j`), and total
 **wall time**.
+
+### Oracle distance & progress (`opt_dist`, `prog`)
+
+`--per-run` now also prints `opt=<N>` and `prog=<0..1>`. `opt_dist` is the **true
+shortest-path distance** start→goal, computed by an A* oracle over the *full* map
+(`planning/astar.true_path_distance`, 4-connected free-space cells — matching what
+the agent's planner navigates), **not** straight-line. The two diverge enormously
+on mazes: e.g. maze2128 is 16.3 cells straight-line but **277 cells** along the only
+free path (17×); maze2391 39.8 → 314 (7.9×); open room2167 only 1.3×. This is why a
+maze run that "completes fine" still takes thousands of steps — the path really is
+that long. The oracle is measurement-only; the agents never see it.
+
+`prog` (mission progress, 0→1, used to grade non-completing runs by closeness) is
+now measured against this oracle path distance instead of straight-line, for both
+the start→goal→start total (`2·opt_dist`) and the claimer's *remaining* distance
+(an oracle path from its true cell to the target). Before, a maze failure could
+show a misleadingly high progress because the goal was straight-line-near while
+path-far. (Cached `progress` values in the pre-2026-06-19 search JSONs predate this
+and used straight-line; re-run if exact comparability is needed.)
 
 ### Diagnostics ("how often did the agent think the map was wrong")
 
@@ -65,10 +84,52 @@ run with every agent's per-step `[step, true_x, true_y, bel_x, bel_y, err,
 search_flag]`. Off by default (one file ≈ 0.5 MB for a 4000-step run); use it to
 replay/plot a specific failing seed.
 
-## Standard seed set
+## Curated seed sets
 
-Defined in `STANDARD_SEEDS` in `tools/sweep.py`: 10 seeds each for `room`, `bsp`,
-`cave` (30 runs), at the default `map_width/height = 41`, `num_agents = 3`.
+Three sets in `tools/sweep.py`, all at `map_width/height = 41`, `num_agents = 3`,
+cut from searches over seeds 2000–23xx with `behaviour_seed = map_seed`, all
+recovery features ON (room/bsp/cave: a 999-run search; maze: a separate 400-run
+search). Select with `--set {easy,hard,impossible}` (default `hard`). With a set,
+`--maps` defaults to that set's own map keys. Replay any seed by setting BOTH
+`map_seed` and `behaviour_seed` to it.
+
+- **`EASY_SEEDS` (24):** the fastest completers per map (room/bsp/cave/maze, 6
+  each), all completing in **< 400 steps** (slowest member 66). A quick
+  ~100%-completion smoke/regression check (**24/24, avg 25 steps, ~0.6 s**) to run
+  *before* the longer sets.
+- **`HARD_SEEDS` (40):** slowest completers (balanced per map) + failures spread
+  across "closeness to finishing" (75% returning-home … 0% never-reached-goal),
+  ~half/half. Discriminating both ways — failures can be rescued by a fix, slow
+  completers can regress. Baseline **20/40**. Includes maze (5 slow completers +
+  5 spread failures).
+- **`IMPOSSIBLE_SEEDS` (60):** seeds that failed at `behaviour = map` — room 12,
+  bsp 1, cave 17 (3% of the 999-run search) + a 30-seed closeness-spread of maze
+  failures (maze failed 240/400; too many to list all, so the persisted slice is
+  representative — full set reproducible from the searches). Baseline **0/60** by
+  construction. Not literally unsolvable (most are behaviour-specific), but the
+  genuinely hard cases — use to hunt failure modes / confirm a fix rescues them.
+
+**Search findings (2026-06-18):**
+- room/bsp/cave: 30/999 fail (3%) — concentrated in **cave** (17) and **room**
+  (12); **bsp** robust (1). Closest failures reach the goal and stall on the way
+  home (~75%); the rest (mostly cave) never reach it (localization-drift wall).
+- **maze: 160/400 complete — 60% FAIL**, by far the hardest. Maze is all narrow
+  corridors, where a local-mode belief offset *along* a corridor is unobservable
+  (the same aperture problem behind the goal-claim deadlock); room/bsp/cave have
+  open areas and corners that pin the pose. Maze is the clearest case for a
+  loop-closure back-end. It is curated into the sets but kept off the default
+  `--maps` for the older room/bsp/cave numbers' comparability.
+
+Re-cut with `/tmp/search1000.py` / `/tmp/search_maze.py` after a difficulty shift.
+
+### Earlier set — the overfitting lesson (kept for context)
+
+The original standard set was maps {room,bsp,cave} × seeds **1–20** (60 runs).
+Reusing the same 20 seeds for every experiment overfit the tuning to them: by
+mid-development almost every run completed (56/60) regardless of the change under
+test, so the sweep had **lost discriminating power** — it could no longer tell a
+real improvement from noise. Concretely, search mode measured **56/60 with and
+without** it on that set, hiding a genuine effect (see results log).
 
 ### Why these seeds (and the overfitting lesson)
 
@@ -257,3 +318,98 @@ Two proposed upgrades, A/B'd on the all-on hard set (baseline 14/30):
   default config: curated **27/30** vs random **26/30** (loc 0.42, max 8.46) — the
   random, never-tuned maps perform on par with the curated set, so the cumulative
   gains generalize rather than overfitting the curated seeds.
+
+### 2026-06-17 — Mapping speed (compute + exploration)
+
+Profile-led; see SLAM_REPORT §23–24. cProfile of the mapping path (after the
+filter was already optimized) showed `_merge_maps` was **not** a hotspot (1%); the
+costs were `range_scan` (21%), `sense` FOV (15%), and a triple-wrapper
+`is_free`/`in_bounds` chain.
+
+- **Compute, shipped (content-preserving):** fast inline grid lookups in the ray
+  casters + a per-cell FOV shadowcast cache. Profile total **7.49→5.95 s
+  (−20.6%)**, `range_scan` −53%, `sense` −64%, **bit-identical** (world 30/30 and
+  hard 27/30 reproduce exactly). Per-step cost is now dominated by the (untouched,
+  accuracy-critical) SLAM filter.
+- **Exploration efficiency, rejected:** gain-weighted frontier selection
+  (`frontier_gain_weight`) — best case ~3% fewer steps but regresses accuracy
+  (max drift 2.47→3.59, warp 3.16→4.83); default 0. Note: hard-set avg-steps is
+  dominated by the 3 capped non-completers (~400 of 992), so the real step lever is
+  fixing those drift failures (loop closure), not frontier selection.
+
+### 2026-06-18 — Goal-claim deadlock fixed; seed methodology flaw exposed
+
+Running room1089 directly (a user catch) revealed the curated set conflates **map
+difficulty with behaviour luck**: each seed is a single `(map_seed, behaviour_seed
+= map_seed)` sample. room1089's goal is ~6 cells from start (trivial map), yet
+`behaviour_seed=1089` deadlocks — and ~1/3 of behaviour seeds fail it. So "hard
+seed" ≠ "hard map".
+
+- **Deadlock fix (SLAM_REPORT §25):** the 3 standing failures were all a moving
+  limit-cycle (claimer oscillates in place under a ~1-tile belief offset; the
+  blocked-fraction stall gate missed it because the agent keeps moving). Added a
+  long-horizon no-progress detector + a target-directed true-space recovery walk.
+  **Hard set 27→30/30** (avg steps 992→692), **generalization 45/45**, world mode
+  preserved (30/30, 0.247).
+- **Consequence — set is now saturated (30/30), so it no longer discriminates.**
+  TODO (next): re-cut `STANDARD_SEEDS` using a **robust difficulty measure that
+  averages each map over several behaviour seeds**, so a seed is "hard" only if the
+  *map* is consistently hard, not a one-off behaviour fluke. This both re-grounds
+  the set and gives it teeth again.
+
+### 2026-06-18 — 999-run search; HARD and IMPOSSIBLE sets cut
+
+Ran maps {room,bsp,cave} × seeds 2000–2332 (999 runs, `behaviour=map`, all features
+on). **969/999 complete; 30 fail (3%)** — room 12, bsp 1, cave 17. Two sets cut and
+persisted in `tools/sweep.py` (`--set hard|impossible`); baselines: HARD **15/30**,
+IMPOSSIBLE **0/30**. All 30 failures, by closeness to finishing:
+
+```
+returning (reached goal, stuck on the way home):
+  room2302 75%  cave2190 74%  cave2081 71%  cave2119 70%  room2274 68%
+  bsp2205 66%   cave2062 61%  cave2183 49%  room2223 46%  cave2328 43%
+to-goal (never reached goal):
+  cave2038 40%  cave2134 34%  room2262 10%  room2069 7%
+  0%: room2018 room2149 room2163 room2167 room2230 room2299 room2304
+      cave2001 cave2010 cave2019 cave2154 cave2155 cave2175 cave2251 cave2263 cave2285
+```
+
+Pattern: the "close" failures (reach goal, fail returning) span all three maps; the
+"never reach goal" failures are mostly **cave** (drift in open space) plus several
+**room** seeds with low error (0.3–1.3) — likely a residual navigation/seal issue,
+not drift. These are the next things to chase. (Caveat: `behaviour=map` is one
+sample; some of these complete under other behaviour seeds — the same conflation
+noted above. A multi-behaviour re-cut remains the robust follow-up.)
+
+### 2026-06-18 — maze search + EASY set; sets now cover 4 map types
+
+Separate **400-run maze search** (seeds 2000–2399, behaviour=map, all on):
+**160/400 complete — 240 fail (60%)**. Maze is the hardest geometry by a wide
+margin (vs ~3% on room/bsp/cave) — all-corridor maps make the along-corridor
+belief offset unobservable. Folded into the sets "sensibly": HARD += 5 slow maze
+completers + 5 spread maze failures (→40); IMPOSSIBLE += a 30-seed closeness-spread
+of the 240 maze failures (→60, not all 240). Added **`EASY_SEEDS`** (24): fastest
+completers/map across all 4 types, all < 400 steps — **24/24, avg 25 steps, 0.6 s**
+as a pre-flight regression check. `--maps` now defaults to the selected set's map
+keys so maze actually runs.
+
+### 2026-06-19 — IMPOSSIBLE seeds × 20 behaviours; oracle distance metric
+
+**Behaviour-spread test** of 5 IMPOSSIBLE seeds, each run across behaviour seeds
+1–20 (map_seed fixed). Confirms the "impossible" label is a *mix* of behaviour
+flukes and truly hard maps: room2167 **20/20**, bsp2205 **19/20** (easy maps that
+failed only on the single behaviour=map sample); cave2019 **16/20** (genuinely
+fragile — loc err_max 15.97 on some behaviours, the open-area drift gap);
+maze2128 **1/20**, maze2391 **0/20** (genuinely map-hard, corridor aperture). Direct
+evidence for the behaviour/map conflation flagged above. (Script + per-run JSON in
+`/tmp`; every run reproducible via (map_type, map_seed, behaviour_seed).)
+
+**Oracle distance.** Watching maze2128 showed agents completing but via an
+*enormously* long path. Added `planning/astar.true_path_distance` — an A* over the
+full map giving the true shortest free-space path start→goal, and wired it into the
+harness as `opt_dist` and into the `progress` metric (replacing straight-line; see
+the metrics section). maze2128 is 16.3 cells straight-line but **277 along the path
+(17×)**, maze2391 39.8→314, room2167 34.5→45. So the long maze runs aren't the
+agent wandering — the optimal path itself is hundreds of cells, and the SLAM/search
+overhead is now measurable against it (e.g. maze2126 completes in 2517 steps for a
+139-cell optimum). Measurement-only; agents don't use it.

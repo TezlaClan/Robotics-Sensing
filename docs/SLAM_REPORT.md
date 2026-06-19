@@ -703,6 +703,164 @@ Generalization: a 30-run batch of **fresh random seeds** (the new overfit check,
 see `docs/TESTING.md`) scores **26/30** with this config — on par with the curated
 set, i.e. the gains are not overfit to the curated seeds.
 
+## 23. Mapping/sensing speed — profile-led, content-preserving
+
+Accuracy was good, so the target was per-step compute of the mapping/sensing path
+(the filter was already done in §13–14). **Profiled first** (cProfile, 3 agents ×
+800 steps, cave1018 ≈ 3.12 ms/agent-step). Result overturned the obvious guess:
+
+- SLAM `update` 46% (untouched), **`range_scan` 21%**, **`sense` FOV 15%**,
+  `_filter_occluded` 5%, `_update_internal_map` 0.7%, **`_merge_maps` 1% — NOT a
+  hotspot** (the planned locked-cells-only merge was therefore dropped). The
+  `environment.is_free → map.is_free → map.in_bounds` triple-wrapper was called
+  ~2.1M/3.6M times feeding both ray casters — pure overhead.
+
+Two content-preserving changes (`sensing/sensor_model.py`):
+
+1. **Fast static-map blocked test.** `range_scan._cast_ray` and the FOV predicates
+   now read `map.grid` directly with inline bounds checks instead of the wrapper
+   chain (identical truth values; OOB = no hit, as before).
+2. **FOV shadowcast cache.** `visible_cells` is recomputed only when the agent's
+   integer cell changes (the true map is static; the agent crosses a cell ~every 5
+   steps). Per-cell occupancy + noise still runs every step, so observations are
+   unchanged. Cache hit ~89% (`visible_cells` calls 2400 → 267).
+
+Result: profile total **7.49 s → 5.95 s (−20.6 %)**, function calls 22.3M → 14.6M;
+`range_scan` cumulative −53%, `sense` −64%. **Bit-identical**: world mode 30/30 /
+0.248 / max 1.299 / warp 0.01 and the hard set 27/30 / 0.364 / 2.466 / 3.16 both
+reproduce exactly. (Occlusion early-out considered and skipped — walls lock within
+~10–20 steps, so a "no locked walls" guard helps only the first few steps; not
+worth a counter that could silently skip the filter.)
+
+## 24. Exploration efficiency — gain-weighted frontier selection (rejected)
+
+Idea: pick frontiers by expected information gain (unknown cells in the 3×3 around
+the frontier) traded against distance, not pure nearest, to cut steps-to-map.
+Tunable `frontier_gain_weight` (0 = nearest, bit-identical to before). A/B on the
+hard set (baseline gain 0: 27/30, loc 0.364, max 2.466, warp 3.16, **992 steps**):
+
+| gain_weight | completion | loc mean | loc max | warp | steps |
+|---|---|---|---|---|---|
+| 0.0 (nearest) | 27/30 | 0.364 | 2.47 | 3.16 | 992 |
+| 0.5 | 26/30 | 0.436 | 19.75 | 7.19 | 1128 |
+| 1.0 | 27/30 | 0.586 | 18.63 | 6.46 | 973 |
+| 2.0 | 27/30 | 0.344 | 3.59 | 4.83 | 961 |
+
+**Rejected** (default 0, kept as opt-in lever). Best case shaves ~3% steps
+(992→961) but **regresses accuracy** (max drift 2.47→3.59, warp 3.16→4.83) and
+just shuffles which seeds fail — it fails the "fewer steps AND no accuracy
+regression" gate. Mechanism: sending agents to farther high-gain frontiers means
+more travel under local-mode drift. Also, on this set avg-steps is dominated by the
+**3 non-completing runs** (each capped at 4000 → ~400 of the 992 average); the 27
+completers are already fast, so frontier-selection tweaks can't help much. The real
+"fewer steps" lever is completing those 3 drift failures — a loop-closure/accuracy
+problem (the standing back-end gap), not exploration selection.
+
+## 25. Goal-claim deadlock — moving limit-cycle recovery
+
+The 3 standing hard-set failures (room1089, room1071, cave1137) were all the same
+bug, found by running room1089 directly (its goal is only ~6 cells from start — a
+trivially easy map, yet it failed; ~1/3 of *behaviour* seeds fail it, so it is a
+behaviour-specific deadlock, not a hard map — see §"measurement" note in
+`docs/TESTING.md`).
+
+**Diagnosis** (per-step trace of the claimer): the claimer's **true** position is
+frozen for the whole run, yet `actual_motion` is non-zero *every step* and net
+displacement is ~0 — a **moving limit-cycle**. Its belief frame is offset ~1 tile
+(an unobservable along-corridor shift), so the believed-frame path keeps walking
+its true position into a true wall → oscillation. Because the offset is
+self-consistent, no wall is contradicted (so erosion never fires) and — the key
+gap — the search/stall detector requires `blocked_fraction ≥ 0.5`, but a limit
+cycle moves constantly (`blocked_fraction ≈ 0.2`), so **detection never tripped**.
+
+**Fix (two parts):**
+1. *Detection* — a **long-horizon no-progress** trigger: if the believed cell nets
+   `< stuck_progress_min` (2.0) cells over the last `stuck_progress_window` (80)
+   steps, the agent is stuck *regardless of whether it is "blocked"*. Catches the
+   moving cycle the blocked-fraction gate misses.
+2. *Response* — a **target-directed true-space recovery walk**. The goal (and the
+   start) are world coordinates, and so is the agent's true position, so when the
+   agent is chasing a fixed mission target we BFS a short path toward it through
+   **true-free space** and follow it (suspending the offset-frame planner until it
+   is consumed). This makes genuine progress and reaches the goal *regardless of
+   the belief offset*; `_check_goal` keys off the true position, so it completes.
+
+**Failed first attempt:** routing the long-stall to the existing full hard recovery
+(`_unlock_all` + reopen + random step) made it *worse* — it destroyed the correctly
+anchored start walls and the prefer-unknown step pushed the claimer *up the empty
+corridor* away from the goal (goal-dist 2.7→23, 38 recoveries, recovery thrash).
+The lesson: for a frame-offset cycle, preserve the map and move *toward the target
+in true space*, don't nuke and wander.
+
+**Results** (default config, local mode):
+- 3 bad runs: all now complete (room1089 159 steps, cave1137 211, room1071 1865;
+  were all 4000-step failures).
+- Hard set: **27/30 → 30/30**, avg steps 992 → 692 (the capped runs now finish),
+  loc mean 0.364→0.373, warp 3.16→3.63 (held).
+- Fresh-random generalization: **45/45** (loc 0.268, max 2.80).
+- `world` mode preserved: 30/30, mean 0.247, warp 0.01 (the recovery can fire there
+  too but is harmless — completion/accuracy unchanged).
+
+Tunables: `stuck_progress_window` (80), `stuck_progress_min` (2.0). Note: the hard
+set is now saturated (30/30), which motivates re-cutting it with a robust
+multi-behaviour difficulty measure (the deadlock showed a single (map, behaviour)
+sample conflates map difficulty with behaviour luck).
+
+## 26. Wall-affinity (perception-aware) navigation — rejected
+
+Idea (for open caves): the SLAM filter has no geometry to localize against when no
+walls are within sensing range, so the believed pose drifts in the open. Bias A*
+to keep walls within sensor range by penalising routes through cells far from a
+wall, as a **soft** cost (not a hard constraint) so when the goal is out in the
+open and no near-wall route exists the penalty self-lifts and A* still returns a
+path. Implemented behind `nav_wall_affinity` (default off), with
+`nav_wall_affinity_weight` / `nav_wall_affinity_comfort` (comfort defaults to
+`sensor_range`). Default-off path is unchanged (bit-identical: `wall_dist` stays
+`None`, `_cost` returns 1.0).
+
+A/B on **60 cave seeds (1000–1059)**; baseline (off): **59/60, loc mean 0.397, max
+9.33, warp 5.48, 464 steps, 2.21 ms/agent-step**.
+
+**Variant A — penalise distance to the *nearest* wall:**
+
+| comfort / weight | completion | loc mean | loc max | warp | steps | ms/step | jump-gates |
+|---|---|---|---|---|---|---|---|
+| baseline (off) | 59/60 | 0.397 | 9.33 | 5.48 | 464 | 2.21 | 52 |
+| 8 / 1.0 | 58/60 | 0.541 | 21.49 | 6.10 | 527 | 2.44 | 706 |
+| 4 / 0.5 | 56/60 | 0.549 | 23.33 | 6.16 | 613 | 2.57 | 511 |
+
+Net-negative, and the **jump-gate count explodes (52→706)** — diagnostic of the
+mechanism: hugging the *nearest single* wall makes the corridor **aperture problem
+worse**, not better. A lone wall constrains pose only perpendicular to itself;
+sliding *along* it leaves the along-wall direction unconstrained, so along-corridor
+drift (and teleport-gating) increases. Tighter comfort = more hugging = worse.
+
+**Variant B — penalise per-*axis* wall coverage** (nearer wall scanning left/right
+for x, up/down for y; an axis with no wall within comfort is penalised; a cell with
+walls in range on *both* axes — a corner/junction — gets 0). This targets the
+actual failure mode: the open middle of a long corridor is penalised on its open
+axis, biasing toward structure that pins both axes.
+
+| comfort / weight | completion | loc mean | loc max | warp | steps | ms/step |
+|---|---|---|---|---|---|---|
+| baseline (off) | 59/60 | 0.397 | 9.33 | 5.48 | 464 | 2.21 |
+| 8 / 1.0 | 58/60 | 0.442 | 17.56 | 6.61 | 498 | 4.19 |
+| 5 / 0.5 | 57/60 | 0.586 | 19.67 | 6.20 | 553 | 3.91 |
+
+Better than Variant A (jump-gates 706→102 at comfort 8) but **still net-negative on
+every metric**, and ~2× the compute (per-cell axis ray-scans). It only *reshuffles*
+which seeds fail (1030/1057 instead of 1018), never improving the count, and the
+rare drift episodes (loc max) get *worse*, not better — the longer/curvier wall-
+biased paths give more travel under local-mode drift (same mechanism that sank
+gain-weighted selection, §24).
+
+**Rejected** (default off, kept as an opt-in lever so the negative result is
+reproducible). Conclusion: path-biasing toward walls does not improve open-area
+localization here — the baseline's jump-gating + occlusion + erosion already manage
+open-cave drift (59/60, mean 0.397), and biasing the route trades exploration
+efficiency and compute for *worse* drift. The real open-area lever remains a
+loop-closure back-end, not perception-aware routing.
+
 ## Updated tunables (`config.py`, additions)
 ```
 swarm_slam              True   inter-agent pose anchoring
@@ -720,8 +878,14 @@ search_block_frac       0.5    min blocked-step fraction in the window for a rea
 search_linger           6      steps to dwell at a survey target so its wall can erode
 erosion_protect_steps   30     steps a freshly-eroded cell resists a peer re-locking it
 nav_locked_only         True   A* blocks only on LOCKED walls (unlocked >wall = penalised)
+nav_wall_affinity       False  EXPERIMENTAL: bias routes to keep walls in sensor range (rejected, §26)
+nav_wall_affinity_weight 1.0   penalty per excess cell beyond comfort (when affinity on)
+nav_wall_affinity_comfort None per-axis wall-distance tolerance; None = sensor_range
 merge_reconsider        False  EXPERIMENTAL: re-sense a wall a peer contradicts (net-negative)
 occlusion_block         True   drop observations whose ray crosses a locked wall (local mode)
+frontier_gain_weight    0.0    EXPERIMENTAL: info-gain vs distance in frontier pick (rejected)
+stuck_progress_window   80     steps over which tiny net displacement = stuck (limit-cycle)
+stuck_progress_min      2.0    min net believed-cell displacement over that window
 ```
 
 ## Net state after Part II
@@ -730,13 +894,12 @@ occlusion_block         True   drop observations whose ray crosses a locked wall
   search mode + targeted erosion protection, the believed-frame map self-heals
   displaced walls and the agent surveys its way out of a seal instead of jittering.
   On the plain-selected A/B set: **27/30, mean ~0.39, worst-case ~5.3 cells.**
-- A new **all-features-on hard set** (`tools/sweep.py` STANDARD_SEEDS, selected to
-  surface remaining weaknesses) started at **14/30**, reached **17/30** with
-  `nav_locked_only` (§21), and is now at **27/30** with occlusion gating (§22) —
-  the single biggest win, which collapsed the catastrophic-drift cases (worst-case
-  error 21→2.5 cells). A fresh-random generalization batch scores **26/30** with
-  the same config, so the gains are not overfit to the curated seeds. Remaining
-  failures: room1089, room1071, cave1137.
+- A new **all-features-on hard set** (`tools/sweep.py` STANDARD_SEEDS) tracked the
+  progress: **14/30** → **17/30** (`nav_locked_only`, §21) → **27/30** (occlusion
+  gating, §22, the biggest accuracy win, worst-case error 21→2.5 cells) → **30/30**
+  (limit-cycle deadlock recovery, §25). Fresh-random generalization is **45/45**.
+  The set is now saturated, so the next step is re-cutting it with a robust
+  multi-behaviour difficulty measure (§25 / `docs/TESTING.md`).
 - The remaining `local` gap (and the residual maze aliasing from Part I) is still
   the same fundamental limit for the drift cases: **no loop closure / pose-graph
   back-end** — re-anchoring against the known start region on the return trip is

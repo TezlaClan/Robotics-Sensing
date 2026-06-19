@@ -78,7 +78,7 @@ CONFIG = {
     "comm_mode": "local",        # "global" (always) or "local" (within range only)
     "communication_range": 5.0, # cells; range for "local" comms and swarm anchoring
     "comm_packet_loss": 0.1,     # chance a map transmission is dropped
-    "comm_corruption": 0.0,      # per-cell chance a transmitted value is corrupted
+    "comm_corruption": 0.05,      # per-cell chance a transmitted value is corrupted
 
     # Swarm SLAM: a confident agent's pose anchors a less-confident neighbour
     # in range (collaborative localization).
@@ -191,6 +191,21 @@ CONFIG = {
     # route, so phantoms that never lock never seal; real walls lock and block.
     "nav_locked_only": True,
 
+    # Wall-affinity (perception-aware) navigation: in open maps (caves) the SLAM
+    # filter has no geometry to localize against when no walls are within sensing
+    # range, so the believed pose drifts. When on, A* penalises routing through a
+    # free cell whose nearest believed wall is further than `comfort` cells away,
+    # in proportion to the excess - biasing paths to keep walls within sensing
+    # range so the filter stays constrained. It is a SOFT penalty, not a hard
+    # constraint: when the goal is out in the open and no near-wall route exists,
+    # A* still returns the least-penalty path, so the constraint effectively lifts
+    # itself. comfort defaults to sensor_range when None. EXPERIMENTAL, default off
+    # until an A/B shows it helps (cave / open-area localization) without
+    # regressing completion or steps elsewhere.
+    "nav_wall_affinity": False,
+    "nav_wall_affinity_weight": 1.0,
+    "nav_wall_affinity_comfort": None,
+
     # Map merge: when an agent has a cell locked as a WALL that a peer confidently
     # sees as free, distrust it and reset to unknown so sensing re-decides. EXPERIMENTAL,
     # default OFF: measured net-negative on the hard set (16/30 vs 17/30 with it off,
@@ -208,4 +223,21 @@ CONFIG = {
     # (not allowed to change the map). The wall being looked at is still mapped;
     # only cells beyond it are blocked.
     "occlusion_block": True,
+
+    # Frontier selection: 0 = nearest reachable frontier (greedy). >0 trades
+    # expected information gain (unknown cells around a frontier) against travel
+    # distance, preferring frontiers that reveal more of the map per step. Default
+    # 0 (pure nearest) until an A/B shows a gain version cuts avg steps with no
+    # completion/accuracy regression.
+    "frontier_gain_weight": 0.0,
+
+    # Long-horizon no-progress recovery: a moving limit-cycle (e.g. the goal-claim
+    # deadlock - oscillating in place under a stale belief-frame offset) keeps
+    # actual_motion non-zero, so the zero-motion stuck timer and the blocked-
+    # fraction search gate both miss it. If the believed cell nets less than
+    # `stuck_progress_min` cells over the last `stuck_progress_window` steps, the
+    # agent is treated as stuck and escalated to hard recovery (physical step +
+    # re-localize), regardless of whether it is "blocked".
+    "stuck_progress_window": 80,
+    "stuck_progress_min": 2.0,
 }

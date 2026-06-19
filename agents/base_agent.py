@@ -62,6 +62,8 @@ class BaseAgent:
         search_linger: int = 6,
         erosion_protect_steps: int = 30,
         occlusion_block: bool = True,
+        stuck_progress_window: int = 80,
+        stuck_progress_min: float = 2.0,
     ):
         self.id = agent_id
 
@@ -206,6 +208,21 @@ class BaseAgent:
         # maneuvering slowly is not - this is what separates a real stall from
         # ordinary slow progress, so search mode doesn't fire on healthy runs.
         self._blocked_history: deque = deque(maxlen=max(2, search_window))
+        # Long-horizon no-progress detector. A moving limit-cycle (the goal-claim
+        # deadlock: oscillating ~half a tile around a fixed spot under a stale frame
+        # offset) keeps `actual_motion` non-zero every step, so neither the
+        # zero-motion stuck timer NOR the blocked-fraction search gate fires - yet
+        # net displacement is ~0 for hundreds of steps. This window tracks net
+        # believed-cell displacement over a long horizon and escalates to hard
+        # recovery (physical step + re-localize) when it stays tiny, regardless of
+        # whether the agent is "blocked".
+        self.stuck_progress_window = stuck_progress_window
+        self.stuck_progress_min = stuck_progress_min
+        self._long_history: deque = deque(maxlen=max(2, stuck_progress_window))
+        # True while following a limit-cycle recovery walk (a TRUE-space path toward
+        # the mission target); normal planning is suspended until it is consumed so
+        # the offset-frame planner can't immediately overwrite it and re-deadlock.
+        self._recovery_walk_active = False
         # Set whenever a believed-wall is cleared (erosion / boundary reopen); the
         # signal that a sealing phantom may have opened, so search mode can exit.
         self._wall_removed = False
@@ -516,12 +533,24 @@ class BaseAgent:
             and self._blocked_fraction() >= self.search_block_frac
         )
 
+        # Long-horizon no-progress: net displacement stays tiny over a long window
+        # even though the agent is still moving (a frame-offset limit cycle). This
+        # is the goal-claim deadlock the blocked-fraction gate above misses.
+        self._long_history.append(agent_cell)
+        long_stalled = (
+            self.search_recovery
+            and len(self._long_history) == self._long_history.maxlen
+            and self._long_net_progress() < self.stuck_progress_min
+        )
+
         # =========================
-        # Recovery if frozen too long (any mission phase)
+        # Recovery: frozen too long (full hard recovery)
         # =========================
         if self.stuck_steps >= self.stuck_limit:
             self.stuck_steps = 0
             self.n_recoveries += 1
+            self._long_history.clear()
+            self._pos_history.clear()
             # A hard recovery means search mode (if it was running) did not free us;
             # reset it so it starts fresh afterwards.
             self.search_mode = False
@@ -544,6 +573,48 @@ class BaseAgent:
                 self.current_path = [step_cell]
                 self.steps_since_replan = 0
                 return
+
+        # =========================
+        # Recovery: moving limit-cycle (frame-offset goal-claim deadlock)
+        # =========================
+        # The agent is still moving every step but nets nowhere - its belief frame
+        # is offset, so its believed-frame path keeps walking its TRUE position into
+        # a TRUE wall. Don't nuke the map (that destroys the correctly-anchored
+        # start walls and just makes it wander). Instead, when chasing a FIXED
+        # mission target (the goal, or the start on the way home), walk the TRUE
+        # position toward that target through TRUE-free space: the target is a world
+        # coordinate and so is our true position, so this makes real progress and
+        # reaches the goal regardless of the belief offset. While exploring (no fixed
+        # target) fall back to the normal step-into-free-neighbour break-out.
+        if long_stalled:
+            self.n_recoveries += 1
+            self._long_history.clear()
+            self._pos_history.clear()
+            self.search_mode = False
+            self._search_visited.clear()
+            self._linger_steps = 0
+            target_cell = self._mission_target_cell(environment)
+            if target_cell is not None:
+                path = self._true_path_toward(environment, target_cell, max_len=6)
+                if path:
+                    self.current_path = path
+                    self._recovery_walk_active = True
+                    self.steps_since_replan = 0
+                    return
+            step_cell = self._recovery_step(environment)
+            if step_cell is not None:
+                self.current_target = step_cell
+                self.current_path = [step_cell]
+                self.steps_since_replan = 0
+                return
+
+        # Keep following an in-progress limit-cycle recovery walk (a TRUE-space path
+        # toward the mission target) until it is consumed, so the offset-frame
+        # planner below can't overwrite it and drop us straight back into the cycle.
+        if self._recovery_walk_active:
+            if self.current_path:
+                return
+            self._recovery_walk_active = False
 
         # =========================
         # Search mode (stalled against a sealing wall)
@@ -665,6 +736,15 @@ class BaseAgent:
             return float("inf")
         ox, oy = self._pos_history[0]
         cx, cy = self._pos_history[-1]
+        return math.hypot(cx - ox, cy - oy)
+
+    def _long_net_progress(self) -> float:
+        """Net believed-cell displacement over the long-horizon window. Tiny for a
+        frozen OR an oscillating (limit-cycle) agent, large for one truly moving."""
+        if len(self._long_history) < 2:
+            return float("inf")
+        ox, oy = self._long_history[0]
+        cx, cy = self._long_history[-1]
         return math.hypot(cx - ox, cy - oy)
 
     def _blocked_fraction(self) -> float:
@@ -824,6 +904,53 @@ class BaseAgent:
         ]
         pool = unknown if unknown else free
         return self.rng.choice(pool)
+
+    def _mission_target_cell(self, environment):
+        """The fixed world target this agent is committed to, if any: the start
+        while returning home, or the goal if this agent is the assigned claimer and
+        the goal has been discovered. None while exploring."""
+        if self.returning_to_start:
+            return environment.map.start
+        if (self._goal_discovered(environment)
+                and self.coordinator.goal_claimer == self.id):
+            return environment.map.goal
+        return None
+
+    def _true_path_toward(self, environment, target_cell, max_len=6):
+        """BFS over TRUE-free space from the true cell toward `target_cell`,
+        returning the first `max_len` cells of the shortest path (excluding the
+        start). Used only by limit-cycle recovery: the target and the true position
+        are both world coordinates, so walking the true position toward the target
+        through real free space makes genuine progress even when the belief frame is
+        offset. Returns None if unreachable in true-free space."""
+        sx, sy = int(self.true_position[0]), int(self.true_position[1])
+        if (sx, sy) == target_cell:
+            return []
+        visited = {(sx, sy)}
+        came = {}
+        queue = deque([(sx, sy)])
+        found = False
+        while queue:
+            cx, cy = queue.popleft()
+            if (cx, cy) == target_cell:
+                found = True
+                break
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nxy = (cx + dx, cy + dy)
+                if nxy in visited or not environment.is_free(*nxy):
+                    continue
+                visited.add(nxy)
+                came[nxy] = (cx, cy)
+                queue.append(nxy)
+        if not found:
+            return None
+        path = []
+        cur = target_cell
+        while cur != (sx, sy):
+            path.append(cur)
+            cur = came[cur]
+        path.reverse()
+        return path[:max_len]
 
     def _set_fixed_target(self, cell):
         """

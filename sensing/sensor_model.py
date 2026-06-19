@@ -55,6 +55,14 @@ class SensorModel:
 
         self.rng = rng_manager.behaviour_rng() if rng_manager else None
 
+        # FOV cache: the shadowcast visible-cell SET depends only on the agent's
+        # integer cell and the (static) true map, but the agent crosses a cell only
+        # every ~5 steps, so it is recomputed far more than it changes. Cache it
+        # keyed on (cx, cy, radius); the per-cell occupancy + noise still runs each
+        # step, so observations are bit-identical - only the recursion is skipped.
+        self._fov_key = None
+        self._fov_cells = None
+
     # =========================
     # Mapping: cell field-of-view
     # =========================
@@ -83,12 +91,26 @@ class SensorModel:
         return observations
 
     def _visible_cells(self, environment, cx, cy, radius) -> set:
-        """Cells visible from (cx, cy) within radius, occluded by walls."""
-        return visible_cells(
-            is_blocked=lambda x, y: not environment.is_free(x, y),
-            in_bounds=environment.map.in_bounds,
+        """Cells visible from (cx, cy) within radius, occluded by walls.
+
+        Cached on the integer cell (the true map is static); recomputed only when
+        the agent's cell changes. The predicates read the grid directly with local
+        bounds checks, avoiding the environment->map->in_bounds wrapper chain that
+        the profile showed dominating (millions of calls)."""
+        key = (cx, cy, radius)
+        if key == self._fov_key:
+            return self._fov_cells
+
+        m = environment.map
+        grid, w, h = m.grid, m.width, m.height
+        cells = visible_cells(
+            is_blocked=lambda x, y: not (0 <= x < w and 0 <= y < h and grid[y][x] == 0),
+            in_bounds=lambda x, y: 0 <= x < w and 0 <= y < h,
             cx=cx, cy=cy, radius=radius,
         )
+        self._fov_key = key
+        self._fov_cells = cells
+        return cells
 
     # =========================
     # Localization: continuous range scan
@@ -136,9 +158,17 @@ class SensorModel:
         """
         DDA grid traversal from a continuous origin. Returns the distance to the
         first obstacle surface, or None if nothing is hit within max_r.
+
+        Reads the true grid directly with inline bounds checks (the profile showed
+        the environment.is_free -> map.is_free -> in_bounds chain, called once per
+        cell per beam, was a top cost). Behaviour is identical: out-of-bounds = no
+        hit (None), a wall cell = hit; the origin being wall/OOB returns 0.0.
         """
+        m = environment.map
+        grid, w, h = m.grid, m.width, m.height
+
         cx, cy = int(ox), int(oy)
-        if not environment.is_free(cx, cy):
+        if not (0 <= cx < w and 0 <= cy < h and grid[cy][cx] == 0):
             return 0.0
 
         if ux != 0:
@@ -173,9 +203,9 @@ class SensorModel:
 
             if t > max_r:
                 return None
-            if not environment.map.in_bounds(cx, cy):
+            if not (0 <= cx < w and 0 <= cy < h):
                 return None
-            if not environment.is_free(cx, cy):
+            if grid[cy][cx] != 0:
                 return t
 
     def _noisy_range(self, r, max_r):
